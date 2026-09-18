@@ -7,7 +7,7 @@
 |---|---|---|
 | 発話 | 「AIメモ、〜、AIメモ」 | 用件だけ |
 | 原文の保持 | 言い換え・日時補完が起きることがある | 音声認識の生テキストがそのまま |
-| PCが動き出すまで | 最大30秒（ポーリング待ち） | 1秒程度（取り込み時に即合図） |
+| PCが動き出すまで | 最大30秒（ポーリング待ち） | 1秒程度（スマホから直接合図） |
 | 届いた確認 | ローカルの処理完了まで分からない | 発話直後にバイブ |
 | 圏外時 | 失敗しても気づけない | Automate 側で再送できる |
 
@@ -37,12 +37,12 @@ Apps Script エディタに貼り直し、**既存デプロイを更新**して�
 
 ## 3. Automate のフローを作る
 
-必要なブロックは5つです。
+必要なブロックは6つです。**HTTPリクエストが2本あります。**
 
 ```
 1. Flow beginning
 2. Speech recognize           →  variable: text
-3. HTTP request
+3. HTTP request  ①取り込み
       Method : POST
       URL    : <config/calendar_webhook.json の endpoint_url>
       Content type: application/json
@@ -50,9 +50,24 @@ Apps Script エディタに貼り直し、**既存デプロイを更新**して�
                 "action":"tasks_ingest",
                 "text":text,
                 "request_id":requestId}
-4. Vibrate                    （成功時の手応え）
-5. Flow end
+4. HTTP request  ②起動合図
+      Method : POST
+      URL    : <config/tasks_event.json の signal_url>
+      Content type: text/plain
+      Body   : tasks_changed
+5. Vibrate                    （成功時の手応え）
+6. Flow end
 ```
+
+### なぜ合図を自分で送るのか
+
+Apps Script に合図を送らせることもできますが、**Googleの送信元から ntfy.sh への
+接続は断続的に数十秒ハングします**。その待ち時間がそのまま①の応答時間になり、
+呼び出し側がタイムアウトします（実測で30秒・60秒とも突破しました）。
+
+スマホからもPCからも ntfy へは1秒未満で届くので、合図は自分で送るのが速く確実です。
+①が失敗しても②は送る必要はありません。逆に②だけ失敗しても、タスクは保存済みなので
+定期ポーリングが最大30秒で拾います。**どちらの失敗もデータは失われません。**
 
 - `requestId` は 2 の直前に `Variable set` で `random()` や現在時刻から作ります。
   **再送時は必ず同じ `requestId` を使い回してください。** 新しく採番すると

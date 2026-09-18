@@ -1,6 +1,7 @@
 import unittest
 from unittest import mock
 
+import tasks_client
 from tasks_client import TasksInboxClient
 
 
@@ -82,14 +83,24 @@ if __name__ == "__main__":
 
 
 
-class IngestSession:
-    def __init__(self, payload=None):
-        self.requests = []
-        self.payload = payload or {"ok": True, "task_id": "t1", "signalled": True}
 
-    def post(self, url, json, timeout):
-        self.requests.append(json)
-        return Response(self.payload)
+class IngestSession:
+    """Accepts both the webhook call and the plain ntfy signal post."""
+
+    def __init__(self, payload=None, signal_status=200):
+        self.requests = []
+        self.signals = []
+        self.payload = payload or {"ok": True, "task_id": "t1"}
+        self.signal_status = signal_status
+
+    def post(self, url, json=None, data=None, headers=None, timeout=None):
+        if json is not None:
+            self.requests.append(json)
+            return Response(self.payload)
+        self.signals.append((url, data))
+        if self.signal_status >= 400:
+            raise RuntimeError(f"signal failed: {self.signal_status}")
+        return Response({}, status_code=self.signal_status)
 
 
 class IngestTests(unittest.TestCase):
@@ -103,7 +114,8 @@ class IngestTests(unittest.TestCase):
 
     def test_text_is_sent_verbatim(self):
         session = IngestSession()
-        self.client(session).ingest_text("明日9時に歯医者って通知して")
+        with mock.patch.object(tasks_client, "load_signal_url", return_value=None):
+            self.client(session).ingest_text("明日9時に歯医者って通知して")
         payload = session.requests[0]
         self.assertEqual(payload["action"], "tasks_ingest")
         self.assertEqual(payload["text"], "明日9時に歯医者って通知して")
@@ -111,13 +123,15 @@ class IngestTests(unittest.TestCase):
 
     def test_optional_fields_are_omitted_when_absent(self):
         session = IngestSession()
-        self.client(session).ingest_text("メモ")
+        with mock.patch.object(tasks_client, "load_signal_url", return_value=None):
+            self.client(session).ingest_text("メモ")
         self.assertNotIn("title", session.requests[0])
         self.assertNotIn("request_id", session.requests[0])
 
     def test_request_id_is_forwarded_for_retry_safety(self):
         session = IngestSession()
-        self.client(session).ingest_text("メモ", title="短い題", request_id="abc")
+        with mock.patch.object(tasks_client, "load_signal_url", return_value=None):
+            self.client(session).ingest_text("メモ", title="短い題", request_id="abc")
         payload = session.requests[0]
         self.assertEqual(payload["title"], "短い題")
         self.assertEqual(payload["request_id"], "abc")
@@ -126,6 +140,35 @@ class IngestTests(unittest.TestCase):
         session = IngestSession({"ok": False, "error": "認証に失敗しました"})
         with self.assertRaises(RuntimeError):
             self.client(session).ingest_text("x")
+
+    def test_the_caller_sends_the_signal_itself(self):
+        """Apps Script must not be on the ntfy path: its egress hangs."""
+        session = IngestSession()
+        with mock.patch.object(
+            tasks_client, "load_signal_url", return_value="https://ntfy.test/topic"
+        ):
+            result = self.client(session).ingest_text("メモ")
+        self.assertTrue(result["signalled"])
+        self.assertEqual(session.signals[0][0], "https://ntfy.test/topic")
+        self.assertEqual(session.signals[0][1], "tasks_changed".encode("utf-8"))
+        self.assertNotIn("signal", session.requests[0])
+
+    def test_a_failed_signal_does_not_lose_the_task(self):
+        session = IngestSession(signal_status=503)
+        with mock.patch.object(
+            tasks_client, "load_signal_url", return_value="https://ntfy.test/topic"
+        ):
+            result = self.client(session).ingest_text("メモ")
+        self.assertEqual(result["task_id"], "t1")
+        self.assertFalse(result["signalled"])
+        self.assertIn("signal_error", result)
+
+    def test_signal_is_skipped_when_unconfigured(self):
+        session = IngestSession()
+        with mock.patch.object(tasks_client, "load_signal_url", return_value=None):
+            result = self.client(session).ingest_text("メモ")
+        self.assertFalse(result["signalled"])
+        self.assertEqual(session.signals, [])
 
 
 if __name__ == "__main__":

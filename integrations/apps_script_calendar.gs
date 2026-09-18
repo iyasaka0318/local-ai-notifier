@@ -19,8 +19,6 @@ const INGEST_REQUEST_PROPERTY_PREFIX = 'INGEST_';
 const INGEST_DEDUPE_MS = 10 * 60 * 1000;
 const INGEST_TITLE_MAX = 40;
 const AI_TASK_LIST_ID_PROPERTY = 'AI_TASK_LIST_ID';
-const SIGNAL_MAX_ATTEMPTS = 3;
-const SIGNAL_RETRY_DELAY_MS = 600;
 
 function doPost(e) {
   let lock = null;
@@ -171,11 +169,17 @@ function doPost(e) {
 
       // Signal immediately instead of waiting for the next poll. The task is
       // already stored, so a signal failure only costs latency, never data.
-      let signal = {ok: false, status: 0, error: 'not_attempted'};
-      try {
-        signal = sendTasksSignalDirect_(properties);
-      } catch (signalError) {
-        signal = {ok: false, status: -1, error: String(signalError).slice(0, 200)};
+      // 既定では合図を送りません。Google の送信元から ntfy への接続は
+      // 断続的に数十秒ハングし、その待ち時間が呼び出し側のタイムアウトに
+      // なります。合図はスマホ／PC から直接送るほうが速く確実です。
+      // ntfy へ到達できない呼び出し元だけ signal:true を指定してください。
+      let signal = {ok: false, status: 0, error: 'skipped_by_default'};
+      if (request.signal === true) {
+        try {
+          signal = sendTasksSignalDirect_(properties);
+        } catch (signalError) {
+          signal = {ok: false, status: -1, error: String(signalError).slice(0, 200)};
+        }
       }
       return jsonResponse_({
         ok: true,
@@ -184,7 +188,6 @@ function doPost(e) {
         signalled: signal.ok,
         signal_status: signal.status,
         signal_error: signal.error || null,
-        signal_attempts: signal.attempts || 1,
         duplicate: false,
       });
     }
@@ -326,47 +329,32 @@ function sendTasksSignalDirect_(properties) {
   if (!signalUrl) {
     return {ok: false, status: 0, error: 'signal_url_not_configured'};
   }
-
-  // ntfy.sh throttles by source IP, and Apps Script egress addresses are
-  // shared with every other script, so a rejection here is expected to be
-  // transient. Retry briefly rather than falling back to the slow poll.
-  let status = 0;
-  let lastError = '';
-  for (let attempt = 0; attempt < SIGNAL_MAX_ATTEMPTS; attempt++) {
-    try {
-      const response = UrlFetchApp.fetch(signalUrl, {
-        method: 'post',
-        contentType: 'text/plain; charset=utf-8',
-        payload: 'tasks_changed',
-        headers: {
-          'Title': 'AI Inbox signal',
-          'Priority': '3',
-        },
-        muteHttpExceptions: true,
-      });
-      status = response.getResponseCode();
-      if (status >= 200 && status < 300) {
-        // 状態ハッシュは意図的に更新しません。算出には避けたい全走査が必要で、
-        // 次回ポーリングが一度だけ重複合図を送るほうが安上がりです。
-        // 重複合図は処理済みタスクを再走査するだけで副作用はありません。
-        properties.setProperty(TASKS_SIGNAL_LAST_SENT_PROPERTY, String(Date.now()));
-        return {ok: true, status: status, attempts: attempt + 1};
-      }
-      lastError = String(response.getContentText() || '').slice(0, 200);
-    } catch (fetchError) {
-      status = -1;
-      lastError = String(fetchError).slice(0, 200);
+  try {
+    const response = UrlFetchApp.fetch(signalUrl, {
+      method: 'post',
+      contentType: 'text/plain; charset=utf-8',
+      payload: 'tasks_changed',
+      headers: {
+        'Title': 'AI Inbox signal',
+        'Priority': '3',
+      },
+      muteHttpExceptions: true,
+    });
+    const status = response.getResponseCode();
+    if (status >= 200 && status < 300) {
+      // 状態ハッシュは意図的に更新しません。算出には全走査が必要で、
+      // 次回ポーリングが一度だけ重複合図を送るほうが安上がりです。
+      properties.setProperty(TASKS_SIGNAL_LAST_SENT_PROPERTY, String(Date.now()));
+      return {ok: true, status: status};
     }
-    if (attempt + 1 < SIGNAL_MAX_ATTEMPTS) {
-      Utilities.sleep(SIGNAL_RETRY_DELAY_MS * (attempt + 1));
-    }
+    return {
+      ok: false,
+      status: status,
+      error: String(response.getContentText() || '').slice(0, 200),
+    };
+  } catch (fetchError) {
+    return {ok: false, status: -1, error: String(fetchError).slice(0, 200)};
   }
-  return {
-    ok: false,
-    status: status,
-    error: lastError || 'signal_failed',
-    attempts: SIGNAL_MAX_ATTEMPTS,
-  };
 }
 
 /** AI Inbox のリストIDをキャッシュし、毎回の全リスト走査を避けます。 */

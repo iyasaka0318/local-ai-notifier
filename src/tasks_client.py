@@ -9,10 +9,44 @@ from project_paths import CONFIG_DIR
 
 TASK_ID_PREFIX = "tasks:"
 INGEST_TIMEOUT_SECONDS = 60
+SIGNAL_TIMEOUT_SECONDS = 15
+TASKS_EVENT_CONFIG_FILE = os.environ.get(
+    "AI_TASKS_EVENT_CONFIG_FILE",
+    str(CONFIG_DIR / "tasks_event.json"),
+)
 WEBHOOK_CONFIG_FILE = os.environ.get(
     "GOOGLE_CALENDAR_WEBHOOK_CONFIG_FILE",
     str(CONFIG_DIR / "calendar_webhook.json"),
 )
+
+
+def load_signal_url():
+    """Topic the local listener is subscribed to, or None when unconfigured."""
+    if not os.path.exists(TASKS_EVENT_CONFIG_FILE):
+        return None
+    with open(TASKS_EVENT_CONFIG_FILE, encoding="utf-8") as file:
+        return (json.load(file).get("signal_url") or "").strip() or None
+
+
+def send_tasks_signal(session=requests, signal_url=None):
+    """Wake the local listener directly.
+
+    Apps Script is deliberately not used for this. Google's outbound path to
+    ntfy.sh intermittently hangs for tens of seconds, and that wait lands on
+    whoever called the webhook. Both the phone and this machine can reach ntfy
+    in well under a second, so the signal belongs on the caller's side.
+    """
+    signal_url = signal_url or load_signal_url()
+    if not signal_url:
+        return False
+    response = session.post(
+        signal_url,
+        data="tasks_changed".encode("utf-8"),
+        headers={"Title": "AI Inbox signal", "Priority": "3"},
+        timeout=SIGNAL_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return True
 
 
 def load_tasks_webhook_credentials():
@@ -132,7 +166,16 @@ class TasksInboxClient:
         # contention, and a client-side timeout here is worse than waiting:
         # the task is created either way, so giving up early only hides a
         # success and invites a duplicate on retry.
-        return self._post(payload, timeout=INGEST_TIMEOUT_SECONDS)
+        result = self._post(payload, timeout=INGEST_TIMEOUT_SECONDS)
+
+        # The task is stored, so a signal failure only costs latency: the
+        # periodic poll still picks it up.
+        try:
+            result["signalled"] = send_tasks_signal(self.session)
+        except Exception as error:
+            result["signalled"] = False
+            result["signal_error"] = str(error)[:200]
+        return result
 
     def get(self, task_id):
         for item in self.all():
