@@ -21,6 +21,16 @@ Google Tasksを音声入力用のAI Inboxとして利用し、ローカルのQwe
 
 ルートの `.cmd` / `.vbs` はWindowsタスクスケジューラとの互換エントリーポイントです。業務ロジックはすべて `src/` にあります。
 
+Linuxでは systemd のユーザーユニットで常駐・定期実行します。
+
+| ユニット | 役割 |
+|---|---|
+| `local-ai-notifier-listener.service` | Google Tasks更新信号の常駐リスナー（取り消しコマンドも受信） |
+| `local-ai-notifier-reminders.timer` | リマインダー配信（1分ごと） |
+| `local-ai-notifier-monitor.timer` | Web監視チェック |
+| `local-ai-notifier-backup.timer` | DBバックアップ（1日1回） |
+| `local-ai-notifier-ollama.service` | Ollamaサーバー |
+
 ## 処理の流れ
 
 1. `tasks_event_listener.py` がGoogle Tasksの更新信号を受信
@@ -31,19 +41,22 @@ Google Tasksを音声入力用のAI Inboxとして利用し、ローカルのQwe
 
 ## 主な実行方法
 
-```powershell
-# AI Inboxを1サイクル処理
-python src/inbox_cycle.py
+すべて `app/` ディレクトリで実行します。`runtime/run-worker.sh` が仮想環境と
+`NTFY_TOPIC` を用意するので、`python` を直接呼ぶ必要はありません。
 
-# イベントリスナー
-.\run_tasks_listener.cmd
+```bash
+# AI Inboxを1サイクル処理
+./runtime/run-worker.sh src/inbox_cycle.py
+
+# イベントリスナー（systemdユーザーサービス）
+systemctl --user restart local-ai-notifier-listener.service
+systemctl --user status  local-ai-notifier-listener.service
 
 # 全テスト
-$env:PYTHONPATH = "$PWD\src"
-python -m unittest discover -s tests -v
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 
 # DB状態の確認
-python scripts/show_inbox.py --details
+./runtime/run-worker.sh scripts/show_inbox.py --details
 ```
 
 通常運用では環境変数 `NTFY_TOPIC` と、`config/` 内のローカル認証設定が必要です。QwenはOllamaの `qwen3:14b` を `http://localhost:11434` で利用します。
@@ -51,7 +64,7 @@ python scripts/show_inbox.py --details
 構造化JSONを高速に生成するため、Ollamaのthinkingは既定で無効です。精度比較などでthinkingを戻す場合は `AI_OLLAMA_THINK=true` を設定してください。稼働中のSQLite DBは次のコマンドで整合性を保ったままバックアップできます。
 
 ```bash
-python scripts/backup_db.py
+./runtime/run-worker.sh scripts/backup_db.py
 ```
 
 保存先は `backups/`、保持数は既定30件です。`AI_EXTERNAL_BACKUP_DIR` を設定すると外部ストレージにも同時保存します。

@@ -26,7 +26,7 @@ Apps Script エディタに貼り直し、**既存デプロイを更新**して�
 スマホを触る前に、PC から同じリクエストを送って確認します。
 
 ```bash
-python scripts/send_test_memo.py "テスト、明日の10時に歯医者って通知して" --twice
+./runtime/run-worker.sh scripts/send_test_memo.py "テスト、明日の10時に歯医者って通知して" --twice
 ```
 
 `signalled=True` が出れば、取り込みと同時にローカルへ合図が飛んでいます。
@@ -92,5 +92,5 @@ Automate 側では、フローの開始ブロックを「Assist request」系の
 どちらの経路で入ったかは次で確認できます。
 
 ```bash
-python scripts/show_inbox.py --details
+./runtime/run-worker.sh scripts/show_inbox.py --details
 ```

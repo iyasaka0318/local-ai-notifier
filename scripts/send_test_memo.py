@@ -32,9 +32,23 @@ def main():
     request_id = args.request_id or str(uuid.uuid4())
     client = get_tasks_inbox_client()
 
-    result = client.ingest_text(args.text, args.title, request_id)
+    try:
+        result = client.ingest_text(args.text, args.title, request_id)
+    except RuntimeError as error:
+        # The pre-ingest deployment falls through to the calendar branch, so
+        # this specific message means the Apps Script is simply out of date.
+        if "必須項目が不足" in str(error):
+            print("Apps Scriptが古い可能性があります。")
+            print("integrations/apps_script_calendar.gs を貼り直し、")
+            print("既存デプロイを『新しいバージョン』で更新してください。")
+            raise SystemExit(1)
+        raise
+
     print(f"1回目: task_id={result.get('task_id')} "
           f"signalled={result.get('signalled')} duplicate={result.get('duplicate')}")
+    if result.get("signalled") is False:
+        print("警告: 取り込みは成功しましたが、ローカルへの合図に失敗しました。")
+        print("      定期ポーリングが拾うので処理はされますが、最大30秒遅れます。")
 
     if args.twice:
         again = client.ingest_text(args.text, args.title, request_id)
