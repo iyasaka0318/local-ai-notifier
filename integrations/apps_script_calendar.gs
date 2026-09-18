@@ -13,7 +13,15 @@ const TASKS_SIGNAL_RETRY_MS = 5 * 60 * 1000;
 const TASKS_LAST_POLL_PROPERTY = 'TASKS_LAST_POLL';
 const TASKS_POLL_STATS_PROPERTY = 'TASKS_POLL_STATS';
 const TASKS_POLL_COOLDOWN_MS = 15 * 1000;
-const TASKS_POLL_TRIGGER_COUNT = 2;
+const TASKS_POLL_TRIGGER_COUNT = 1;
+const TASKS_POLL_INTERVAL_MINUTES = 1;
+const TASKS_POLL_INTERVAL_PROPERTY = 'TASKS_POLL_INTERVAL_MINUTES';
+const TASKS_POLL_COUNT_PROPERTY = 'TASKS_POLL_TRIGGER_COUNT';
+const ALLOWED_POLL_INTERVALS = [1, 5, 10, 15, 30];
+// 合図のfetchがハングしたとき、次のトリガーが即座に再試行して
+// 実行が積み上がるのを防ぎます。
+const TASKS_SIGNAL_ATTEMPT_PROPERTY = 'TASKS_SIGNAL_LAST_ATTEMPT';
+const TASKS_SIGNAL_ATTEMPT_COOLDOWN_MS = 90 * 1000;
 const TASKS_TRIGGER_INSTALL_STAGGER_MS = 15 * 1000;
 const INGEST_REQUEST_PROPERTY_PREFIX = 'INGEST_';
 const INGEST_DEDUPE_MS = 10 * 60 * 1000;
@@ -87,6 +95,34 @@ function doPost(e) {
       return jsonResponse_({ok: true, status: 'configured'});
     }
 
+    // ポーリング頻度を再デプロイなしで変更します。合図は呼び出し側が送るため、
+    // ポーリングはGemini経由の保険として頻度を落とせます。
+    if (request.action === 'tasks_polling_configure') {
+      const properties = PropertiesService.getScriptProperties();
+      if (request.interval_minutes !== undefined) {
+        const interval = Number(request.interval_minutes);
+        if (ALLOWED_POLL_INTERVALS.indexOf(interval) === -1) {
+          throw new Error(
+            '間隔は ' + ALLOWED_POLL_INTERVALS.join('/') + ' 分のいずれかです'
+          );
+        }
+        properties.setProperty(TASKS_POLL_INTERVAL_PROPERTY, String(interval));
+      }
+      if (request.trigger_count !== undefined) {
+        const count = Number(request.trigger_count);
+        if (!(count >= 0 && count <= 6)) {
+          throw new Error('トリガー本数は0〜6で指定してください');
+        }
+        properties.setProperty(TASKS_POLL_COUNT_PROPERTY, String(count));
+      }
+      const applied = installTaskPollingTrigger_();
+      return jsonResponse_({
+        ok: true,
+        interval_minutes: applied.interval,
+        trigger_count: applied.count,
+      });
+    }
+
     if (request.action === 'tasks_polling_status') {
       const triggers = ScriptApp.getProjectTriggers().filter(function(trigger) {
         return trigger.getHandlerFunction() === 'pollTasksAndSignal';
@@ -104,6 +140,7 @@ function doPost(e) {
         ok: true,
         trigger_count: triggers.length,
         cooldown_ms: TASKS_POLL_COOLDOWN_MS,
+        interval_minutes: pollingSettings_().interval,
         signal_url_configured: Boolean(
           properties.getProperty(TASKS_SIGNAL_URL_PROPERTY)
         ),
@@ -390,6 +427,15 @@ function pollTasksAndSignalUnlocked_() {
   // 新規・更新時はすぐ送信。受信漏れに備え、未処理の間は5分ごとに再送します。
   if (state === previousState && now - lastSent < TASKS_SIGNAL_RETRY_MS) return;
 
+  // Googleの送信元からntfyへのfetchは数十秒ハングすることがあります。
+  // 記録を試行の「前」に置かないと、ハング中に次のトリガーが同じfetchを
+  // 積み増し、スクリプト全体が飽和してping応答すら返らなくなります。
+  const lastAttempt = Number(
+    properties.getProperty(TASKS_SIGNAL_ATTEMPT_PROPERTY) || '0'
+  );
+  if (now - lastAttempt < TASKS_SIGNAL_ATTEMPT_COOLDOWN_MS) return;
+  properties.setProperty(TASKS_SIGNAL_ATTEMPT_PROPERTY, String(now));
+
   const response = UrlFetchApp.fetch(signalUrl, {
     method: 'post',
     contentType: 'text/plain; charset=utf-8',
@@ -434,22 +480,40 @@ function authorizeTasksPolling() {
   console.log('Google Tasksの1分監視トリガーを作成しました');
 }
 
+function pollingSettings_() {
+  const properties = PropertiesService.getScriptProperties();
+  let interval = Number(
+    properties.getProperty(TASKS_POLL_INTERVAL_PROPERTY)
+      || TASKS_POLL_INTERVAL_MINUTES
+  );
+  if (ALLOWED_POLL_INTERVALS.indexOf(interval) === -1) {
+    interval = TASKS_POLL_INTERVAL_MINUTES;
+  }
+  let count = Number(
+    properties.getProperty(TASKS_POLL_COUNT_PROPERTY) || TASKS_POLL_TRIGGER_COUNT
+  );
+  if (!(count >= 0 && count <= 6)) count = TASKS_POLL_TRIGGER_COUNT;
+  return {interval: interval, count: count};
+}
+
 function installTaskPollingTrigger_() {
   ScriptApp.getProjectTriggers().forEach(function(trigger) {
     if (trigger.getHandlerFunction() === 'pollTasksAndSignal') {
       ScriptApp.deleteTrigger(trigger);
     }
   });
-  for (let i = 0; i < TASKS_POLL_TRIGGER_COUNT; i++) {
+  const settings = pollingSettings_();
+  for (let i = 0; i < settings.count; i++) {
     ScriptApp.newTrigger('pollTasksAndSignal')
       .timeBased()
-      .everyMinutes(1)
+      .everyMinutes(settings.interval)
       .create();
-    if (i + 1 < TASKS_POLL_TRIGGER_COUNT) {
+    if (i + 1 < settings.count) {
       // Installation-only delay; recurring polling never sleeps.
       Utilities.sleep(TASKS_TRIGGER_INSTALL_STAGGER_MS);
     }
   }
+  return settings;
 }
 
 function listPendingAiTasks_(taskListId) {
