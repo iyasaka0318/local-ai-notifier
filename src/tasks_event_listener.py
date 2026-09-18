@@ -34,14 +34,54 @@ def process_cycle(reason):
     print(f"AI Inbox確認が終了しました: exit={result}", flush=True)
 
 
+_cycle_lock = threading.Lock()
+_last_cycle = time.monotonic()
+
+
+def process_cycle_once(reason):
+    """Serialize cycles so the stream and the safety timer cannot overlap."""
+    global _last_cycle
+    with _cycle_lock:
+        process_cycle(reason)
+        _last_cycle = time.monotonic()
+
+
+def run_safety_checks(interval=FALLBACK_CHECK_SECONDS, sleeper=time.sleep,
+                      clock=time.monotonic, stop=None):
+    """Poll Google Tasks on a timer that does not depend on ntfy.
+
+    The previous check only ran when a line arrived from the ntfy stream, so a
+    connection outage silenced the very fallback that was supposed to cover it.
+    Apps Script's own backup poll signals through the same ntfy topic, so it is
+    not an independent recovery path either.
+    """
+    while stop is None or not stop.is_set():
+        sleeper(min(interval, 300))
+        if stop is not None and stop.is_set():
+            return
+        if clock() - _last_cycle >= interval:
+            try:
+                process_cycle_once("定期確認（ntfy非依存）")
+            except Exception as error:
+                print(f"定期確認に失敗しました: {error}", file=sys.stderr, flush=True)
+
+
+def start_safety_timer():
+    thread = threading.Thread(
+        target=run_safety_checks, name="tasks-safety-timer", daemon=True
+    )
+    thread.start()
+    return thread
+
+
 def listen_forever(signal_url):
     stream_url = signal_url + "/json?since=10m"
     retry_seconds = 1
-    last_cycle = time.monotonic()
     seen_event_ids = set()
 
     # PC停止中に追加されたタスクも拾えるよう、起動直後に必ず確認します。
-    process_cycle("起動時")
+    process_cycle_once("起動時")
+    start_safety_timer()
 
     while True:
         try:
@@ -49,10 +89,6 @@ def listen_forever(signal_url):
                 response.raise_for_status()
                 retry_seconds = 1
                 for raw_line in response.iter_lines(decode_unicode=True):
-                    now = time.monotonic()
-                    if now - last_cycle >= FALLBACK_CHECK_SECONDS:
-                        process_cycle("6時間ごとの保険確認")
-                        last_cycle = time.monotonic()
                     if not raw_line:
                         continue
                     event = json.loads(raw_line)
@@ -68,8 +104,7 @@ def listen_forever(signal_url):
                         # 接続が長期間続いてもメモリ使用量を一定に保ちます。
                         if len(seen_event_ids) > 1000:
                             seen_event_ids = {event_id}
-                    process_cycle("Google Tasks更新信号")
-                    last_cycle = time.monotonic()
+                    process_cycle_once("Google Tasks更新信号")
         except KeyboardInterrupt:
             raise
         except Exception as error:

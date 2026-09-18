@@ -7,7 +7,7 @@
 |---|---|---|
 | 発話 | 「AIメモ、〜、AIメモ」 | 用件だけ |
 | 原文の保持 | 言い換え・日時補完が起きることがある | 音声認識の生テキストがそのまま |
-| PCが動き出すまで | 最大30秒（ポーリング待ち） | 1秒程度（スマホから直接合図） |
+| PCが動き出すまで | ポーリング待ち（経路が正常なら数十秒） | 1秒程度（スマホから直接合図） |
 | 届いた確認 | ローカルの処理完了まで分からない | 発話直後にバイブ |
 | 圏外時 | 失敗しても気づけない | Automate 側で再送できる |
 
@@ -37,27 +37,55 @@ Apps Script エディタに貼り直し、**既存デプロイを更新**して�
 
 ## 3. Automate のフローを作る
 
-必要なブロックは6つです。**HTTPリクエストが2本あります。**
+Apps Scriptは**認証失敗も例外も、HTTP 200のJSONで返します**。応答が返ってきた
+ことは保存成功を意味しません。レスポンス本文を確認する分岐が要ります。
 
 ```
-1. Flow beginning
-2. Speech recognize           →  variable: text
-3. HTTP request  ①取り込み
-      Method : POST
-      URL    : <config/calendar_webhook.json の endpoint_url>
-      Content type: application/json
-      Body   : {"secret":"<同ファイルの secret>",
-                "action":"tasks_ingest",
-                "text":text,
-                "request_id":requestId}
-4. HTTP request  ②起動合図
-      Method : POST
-      URL    : <config/tasks_event.json の signal_url>
-      Content type: text/plain
-      Body   : tasks_changed
-5. Vibrate                    （成功時の手応え）
-6. Flow end
+ 1. Flow beginning
+ 2. Variable set      requestId = 端末の時刻＋乱数
+ 3. Speech recognize  →  text
+ 4. Variable set      端末に {requestId, text} を保存（未送信キュー）
+
+ 5. HTTP request  ①取り込み
+       Method        : POST
+       URL           : <config/calendar_webhook.json の endpoint_url>
+       Content type  : application/json
+       Body          : {"secret":"<同ファイルの secret>",
+                        "action":"tasks_ingest",
+                        "text":text,
+                        "request_id":requestId}
+       Response body : ★保存を有効にする（既定は無効）
+       Read timeout  : ★60秒にする（既定は15秒）
+
+ 6. 判定  status == 200 かつ JSONの ok == true かつ task_id がある？
+       いいえ → 通知「保存できませんでした」＋未送信キューに残す＋終了
+       はい   → 次へ（この時点で保存は確定）
+
+ 7. Vibrate           保存できた手応え
+ 8. 未送信キューから削除
+
+ 9. HTTP request  ②起動合図
+       Method        : POST
+       URL           : <config/tasks_event.json の signal_url>
+       Content type  : text/plain
+       Body          : tasks_changed
+       失敗しても再送しない（②だけの失敗は遅延であって損失ではない）
+
+10. Flow end
 ```
+
+### 実装上の注意
+
+- **既定タイムアウトは15秒です。** Apps Scriptはトリガーと重なると数十秒かかる
+  ことがあるので、60秒へ伸ばしてください。報告された「15秒かかった」はこの既定値
+  とも一致します。
+- **①と②で再送処理を分けてください。** ①の失敗は「保存できていないかもしれない」、
+  ②の失敗は「保存済みだが通知が遅れる」で、取るべき行動が違います。
+- **再送時は必ず同じ `requestId` を使い回してください。** 新しく採番すると二重登録
+  されます。タイムアウトは「失敗」ではなく「結果が分からない」状態で、サーバー側では
+  成功していることがあります。
+- **送信前に端末へ本文と `requestId` を保存してください。** HyperOSにアプリを止め
+  られても、次回起動時に未送信分を再送できます。
 
 ### なぜ合図を自分で送るのか
 
@@ -68,15 +96,6 @@ Apps Script に合図を送らせることもできますが、**Googleの送信
 スマホからもPCからも ntfy へは1秒未満で届くので、合図は自分で送るのが速く確実です。
 ①が失敗しても②は送る必要はありません。逆に②だけ失敗しても、タスクは保存済みなので
 定期ポーリングが最大30秒で拾います。**どちらの失敗もデータは失われません。**
-
-- `requestId` は 2 の直前に `Variable set` で `random()` や現在時刻から作ります。
-  **再送時は必ず同じ `requestId` を使い回してください。** 新しく採番すると
-  二重登録されます。タイムアウトは「失敗」ではなく「結果が分からない」状態で、
-  サーバー側では成功していることがあります。`requestId` を固定していれば、
-  再送しても元のタスクIDが返るだけで済みます。
-- HTTP request ブロックの失敗側の出口は 4 ではなく「通知を出す」に繋いでください。
-  **失敗が無音だと、届かなかったことに気づけません。**
-- 圏外対策をするなら、失敗側から `Wait` → HTTP request に戻す再試行ループにします。
 
 ### アシスタントとして起動させる
 

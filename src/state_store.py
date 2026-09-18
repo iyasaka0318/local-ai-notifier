@@ -356,6 +356,26 @@ def ensure_schema(conn):
         ON pending_remote_deletes (completed_at, last_attempt_at)
     """)
 
+    # The execution report is the only thing that tells the user what was
+    # decided, and the undo button rides on it. Dropping it on a send failure
+    # removes the safety net while the work stays done, so it is queued.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pending_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_note_id TEXT NOT NULL,
+            entries TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at TEXT,
+            last_error TEXT,
+            sent_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_pending_reports_open
+        ON pending_reports (sent_at, created_at)
+    """)
+
     _add_column(conn, "persistent_reminders", "group_name TEXT")
     _add_column(conn, "web_monitors", "notified_at TEXT")
 
@@ -595,6 +615,19 @@ def save_structured_item(
             "UPDATE web_monitors SET status = 'superseded' "
             "WHERE note_id = ? AND status = 'active'",
             (note_id,),
+        )
+    if intent != "persistent_reminder":
+        cursor.execute(
+            "UPDATE persistent_reminders SET status = 'superseded', updated_at = ? "
+            "WHERE source_note_id = ? AND status = 'active'",
+            (now, note_id),
+        )
+    if intent != "research":
+        cursor.execute(
+            "UPDATE research_jobs SET status = 'superseded', updated_at = ? "
+            "WHERE source_note_id = ? "
+            "AND status IN ('pending', 'retry', 'waiting_notify')",
+            (now, note_id),
         )
 
     if intent == "todo":
@@ -1025,6 +1058,29 @@ def supersede_orphan_items(cursor, source_note_id, active_item_ids, now=None):
         """,
         [source_note_id, *active],
     )
+    # These two key their own rows by item id rather than carrying a
+    # source_note_id column, so they are matched by the same prefix rule.
+    like_prefix = f"{source_note_id}{ITEM_ID_SEPARATOR}%"
+    cursor.execute(
+        f"""
+        UPDATE persistent_reminders
+        SET status = 'superseded', updated_at = ?
+        WHERE status = 'active'
+          AND (source_note_id = ? OR source_note_id LIKE ?)
+          AND source_note_id NOT IN ({placeholders})
+        """,
+        [now, source_note_id, like_prefix, *active],
+    )
+    cursor.execute(
+        f"""
+        UPDATE research_jobs
+        SET status = 'superseded', updated_at = ?
+        WHERE status IN ('pending', 'retry', 'waiting_notify')
+          AND (source_note_id = ? OR source_note_id LIKE ?)
+          AND source_note_id NOT IN ({placeholders})
+        """,
+        [now, source_note_id, like_prefix, *active],
+    )
 
 
 # research_jobs and persistent_reminders key their UNIQUE column by item id, so
@@ -1156,3 +1212,68 @@ def drain_remote_deletes(conn, kind, deleter, limit=20):
         mark_remote_delete_done(conn, entry["id"])
         done += 1
     return done, failed
+
+
+# =========================================================
+# Execution reports awaiting delivery
+# =========================================================
+
+def enqueue_report(conn, source_note_id, entries, now=None):
+    cursor = conn.execute("""
+        INSERT INTO pending_reports (source_note_id, entries, created_at)
+        VALUES (?, ?, ?)
+    """, (source_note_id, json.dumps(entries, ensure_ascii=False), now or utc_now()))
+    return cursor.lastrowid
+
+
+def open_reports(conn, limit=20):
+    return [
+        {"id": row[0], "source_note_id": row[1], "entries": json.loads(row[2]),
+         "attempts": row[3]}
+        for row in conn.execute("""
+            SELECT id, source_note_id, entries, attempts
+            FROM pending_reports
+            WHERE sent_at IS NULL
+            ORDER BY created_at
+            LIMIT ?
+        """, (limit,)).fetchall()
+    ]
+
+
+def mark_report_sent(conn, report_id, now=None):
+    conn.execute(
+        "UPDATE pending_reports SET sent_at = ?, last_error = NULL WHERE id = ?",
+        (now or utc_now(), report_id),
+    )
+    conn.commit()
+
+
+def mark_report_failed(conn, report_id, error, now=None):
+    timestamp = now or utc_now()
+    conn.execute("""
+        UPDATE pending_reports
+        SET attempts = attempts + 1, last_attempt_at = ?, last_error = ?
+        WHERE id = ?
+    """, (timestamp, str(error)[:2000], report_id))
+    conn.commit()
+
+
+def drain_reports(conn, sender, limit=20):
+    """Deliver queued reports. Returns (sent, failed)."""
+    sent = 0
+    failed = 0
+    for report in open_reports(conn, limit):
+        try:
+            delivered = sender(report["entries"])
+        except Exception as error:
+            mark_report_failed(conn, report["id"], error)
+            failed += 1
+            continue
+        if delivered is False:
+            # Nothing to send (an empty report). Retiring it keeps the queue
+            # from retrying something that can never succeed.
+            mark_report_sent(conn, report["id"])
+            continue
+        mark_report_sent(conn, report["id"])
+        sent += 1
+    return sent, failed

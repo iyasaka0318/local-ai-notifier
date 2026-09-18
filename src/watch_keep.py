@@ -47,6 +47,8 @@ from state_store import (
     mark_note_processed,
     mark_note_waiting_downstream,
     note_content_hash,
+    drain_reports,
+    enqueue_report,
     is_generated_note,
     item_id_for,
     note_revision,
@@ -968,7 +970,7 @@ DOWNSTREAM_INTENTS = {"wake_briefing", "research"}
 def process_item(conn, cur, item, item_id, source_note_id, ai_text, inbox_source,
                  ai_memo_explicit, pending_calendar_deletes=None):
     """Persist one work item. Returns (report_entry, needs_downstream)."""
-    item, fallback_reason = apply_intent_fallback(item)
+    fallback_reason = item.pop("_fallback_reason", None)
     intent = item["intent"]
 
     if intent == "correction":
@@ -1094,7 +1096,9 @@ def process_item(conn, cur, item, item_id, source_note_id, ai_text, inbox_source
             create_notify_now_command(conn, item_id)
 
     elif intent == "web_monitor":
-        resolved = resolve_web_monitor(ai_text)
+        resolved = item.get("_resolved_monitor")
+        if resolved is None:
+            raise ValueError("監視対象の解決結果がありません")
         upsert_web_monitor(
             cur,
             item_id,
@@ -1226,6 +1230,24 @@ def process_note(conn, cur, keep, note, inbox_source):
     for item in items:
         item.setdefault("title", title)
 
+    # Fallback routing and web lookups happen before the transaction opens.
+    # resolve_web_monitor reaches DDG and Ollama, and holding the write lock
+    # across that (Ollama alone allows 120s) starves every other worker, whose
+    # busy_timeout is 30s.
+    resolved_items = []
+    for raw in items:
+        routed, reason = apply_intent_fallback(raw)
+        routed["_fallback_reason"] = reason
+        if routed["intent"] == "web_monitor":
+            try:
+                routed["_resolved_monitor"] = resolve_web_monitor(ai_text)
+            except Exception as error:
+                print("Web監視の対象解決に失敗:", error)
+                mark_note_failed(conn, note.id, content_hash, error)
+                return False
+        resolved_items.append(routed)
+    items = resolved_items
+
     item_ids = [item_id_for(note.id, index) for index in range(len(items))]
     entries = []
     needs_downstream = False
@@ -1270,13 +1292,12 @@ def process_note(conn, cur, keep, note, inbox_source):
             )
 
     if entries:
-        try:
-            send_execution_report(NTFY_TOPIC, entries)
-        except Exception as error:
-            print("実行報告の送信に失敗:", error)
-            notify_processing_failure(
-                conn, NTFY_TOPIC, "実行報告の通知", note.id, error, retrying=False,
-            )
+        # Queue first, then attempt delivery. The report carries the undo
+        # button, so losing it removes the only way the user finds out a
+        # misclassification happened.
+        enqueue_report(conn, note.id, entries)
+        conn.commit()
+        drain_reports(conn, lambda items: send_execution_report(NTFY_TOPIC, items))
 
     if needs_downstream:
         mark_note_waiting_downstream(conn, note.id, content_hash)

@@ -8,7 +8,8 @@ import requests
 from failure_notifier import notify_processing_failure
 from instance_lock import SingleInstanceLock
 from project_paths import DB_PATH, RUNTIME_DIR, ensure_runtime_directories
-from state_store import ensure_schema, utc_now
+from report_notifier import send_execution_report
+from state_store import drain_remote_deletes, drain_reports, ensure_schema, utc_now
 
 
 NTFY_URL = "https://ntfy.sh"
@@ -348,6 +349,13 @@ def main():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
         ensure_schema(conn)
+        # This worker runs every minute, so it is the natural retry cadence for
+        # anything that could not be delivered when it happened.
+        delivered, _failed = drain_reports(
+            conn, lambda entries: send_execution_report(topic, entries)
+        )
+        if delivered:
+            print(f"Re-sent {delivered} execution report(s)")
         sent = dispatch_due_reminders(conn, topic)
         sent += dispatch_persistent_reminders(conn, topic)
     finally:
