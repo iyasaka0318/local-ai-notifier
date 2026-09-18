@@ -46,6 +46,14 @@ python scripts/show_inbox.py --details
 
 通常運用では環境変数 `NTFY_TOPIC` と、`config/` 内のローカル認証設定が必要です。QwenはOllamaの `qwen3:14b` を `http://localhost:11434` で利用します。
 
+構造化JSONを高速に生成するため、Ollamaのthinkingは既定で無効です。精度比較などでthinkingを戻す場合は `AI_OLLAMA_THINK=true` を設定してください。稼働中のSQLite DBは次のコマンドで整合性を保ったままバックアップできます。
+
+```bash
+python scripts/backup_db.py
+```
+
+保存先は `backups/`、保持数は既定30件です。`AI_EXTERNAL_BACKUP_DIR` を設定すると外部ストレージにも同時保存します。
+
 ## 安全設計
 
 - 処理済み入力と生成済みKeepメモをSQLiteで追跡し、二重処理を防止

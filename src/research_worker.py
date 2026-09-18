@@ -18,6 +18,7 @@ from automation_config import (
     MAX_PAGE_TEXT_CHARS,
     MAX_RESEARCH_PAGES,
     MAX_RESEARCH_RESULTS,
+    OLLAMA_THINK,
 )
 from instance_lock import SingleInstanceLock
 from keep_client import get_authenticated_keep
@@ -67,6 +68,7 @@ def ask_ollama(system_prompt, user_data, schema):
                 {"role": "user", "content": json.dumps(user_data, ensure_ascii=False)},
             ],
             "format": schema,
+            "think": OLLAMA_THINK,
             "stream": False,
             "options": {"temperature": 0.1},
         },

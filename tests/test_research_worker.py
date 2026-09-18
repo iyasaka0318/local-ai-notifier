@@ -1,6 +1,6 @@
 import sqlite3
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import research_worker
 from state_store import ensure_schema, note_content_hash, upsert_research_job, utc_now
@@ -84,6 +84,24 @@ class ResearchWorkerTests(unittest.TestCase):
                    generated_note_id, notified_at
             FROM research_jobs WHERE id = ?
         """, (job_id,)).fetchone()
+
+    def test_ollama_structured_requests_disable_thinking_by_default(self):
+        response = Mock()
+        response.json.return_value = {
+            "message": {"content": '{"status": "ok"}'},
+        }
+        schema = {
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status"],
+        }
+
+        with patch.object(research_worker.requests, "post", return_value=response) as post:
+            result = research_worker.ask_ollama("system", {"input": "test"}, schema)
+
+        self.assertEqual(result, {"status": "ok"})
+        self.assertFalse(post.call_args.kwargs["json"]["think"])
+        response.raise_for_status.assert_called_once_with()
 
     def test_research_completion_notifies_and_finalizes_source(self):
         job = self.add_job()

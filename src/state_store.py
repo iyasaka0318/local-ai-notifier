@@ -33,6 +33,8 @@ def _add_column(conn, table_name, definition):
 
 def ensure_schema(conn):
     """Create or migrate the local schema without deleting existing data."""
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS processed_notes (
             note_id TEXT PRIMARY KEY

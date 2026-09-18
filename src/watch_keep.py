@@ -7,7 +7,7 @@ from ddgs import DDGS
 from datetime import datetime
 
 from ai_memo import is_ready_to_trash, parse_ai_memo, trash_processed_ai_memo
-from automation_config import VAGUE_TIMES
+from automation_config import OLLAMA_THINK, VAGUE_TIMES
 from instance_lock import SingleInstanceLock
 from inbox_client import get_inbox_client
 from output_policy import infer_research_notification_mode, needs_japanese_rewrite
@@ -88,6 +88,7 @@ def ask_ollama(system_prompt, user_data, schema):
             }
         ],
         "format": schema,
+        "think": OLLAMA_THINK,
         "stream": False,
         "options": {
             "temperature": 0.1
@@ -789,7 +790,7 @@ print("Keep 接続OK")
 # 4. DB準備
 # =========================================================
 
-conn = sqlite3.connect(DB_PATH)
+conn = sqlite3.connect(DB_PATH, timeout=30)
 cur = conn.cursor()
 ensure_schema(conn)
 

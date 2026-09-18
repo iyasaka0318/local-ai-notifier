@@ -1,6 +1,13 @@
 import os
 
 
+OLLAMA_THINK = os.environ.get("AI_OLLAMA_THINK", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 VAGUE_TIMES = {
     "morning": os.environ.get("AI_TIME_MORNING", "08:00"),
     "afternoon": os.environ.get("AI_TIME_AFTERNOON", "15:00"),

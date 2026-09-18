@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 from ddgs import DDGS
 from datetime import datetime
 from failure_notifier import notify_processing_failure
+from automation_config import OLLAMA_THINK
 from state_store import ensure_schema
 from project_paths import DB_PATH, ensure_runtime_directories
 
@@ -49,6 +50,7 @@ def ask_ollama(system_prompt, user_data, schema):
             }
         ],
         "format": schema,
+        "think": OLLAMA_THINK,
         "stream": False,
         "options": {
             "temperature": 0.1
@@ -408,7 +410,8 @@ def judge_results(
 
 ensure_runtime_directories()
 conn = sqlite3.connect(
-    DB_PATH
+    DB_PATH,
+    timeout=30,
 )
 ensure_schema(conn)
 
