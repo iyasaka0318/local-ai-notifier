@@ -68,6 +68,10 @@ python scripts/backup_db.py
 | まとめ通知 | 「買い物」などのグループに属する継続リマインドは、1通にまとめて届きます |
 
 制御トピックは既定で `{NTFY_TOPIC}-control` です。`NTFY_CONTROL_TOPIC` で変更できます。
+
+入力はGemini経由のほか、Automateなどのスマホ自動化アプリから `tasks_ingest` で直接投入できます。
+Geminiの言い換えが入らず、取り込み時点でローカルへ合図を送るのでポーリング待ちも発生しません。
+手順は `docs/AUTOMATE_SETUP.md` を参照してください。
 カレンダー予定の取り消しには、`integrations/apps_script_calendar.gs` の再デプロイが必要です（`calendar_delete` アクションを追加済み）。
 
 ## 安全設計

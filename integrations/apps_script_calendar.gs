@@ -15,6 +15,9 @@ const TASKS_POLL_STATS_PROPERTY = 'TASKS_POLL_STATS';
 const TASKS_POLL_COOLDOWN_MS = 15 * 1000;
 const TASKS_POLL_TRIGGER_COUNT = 2;
 const TASKS_TRIGGER_INSTALL_STAGGER_MS = 15 * 1000;
+const INGEST_REQUEST_PROPERTY_PREFIX = 'INGEST_';
+const INGEST_DEDUPE_MS = 10 * 60 * 1000;
+const INGEST_TITLE_MAX = 40;
 
 function doPost(e) {
   let lock = null;
@@ -118,6 +121,64 @@ function doPost(e) {
         );
       }
       return jsonResponse_({ok: true, task_id: taskId, status: 'completed'});
+    }
+
+    // 音声入力アプリ（Automateなど）から直接1件を取り込みます。
+    // Gemini を経由しないので原文がそのまま届き、取り込んだ時点で
+    // ローカルへ合図を送るため、1分ポーリングの待ち時間が発生しません。
+    if (request.action === 'tasks_ingest') {
+      const rawText = String(request.text || '').trim();
+      if (!rawText) {
+        return jsonResponse_({ok: false, error: '本文がありません'});
+      }
+
+      const properties = PropertiesService.getScriptProperties();
+      const requestId = String(request.request_id || '').trim();
+      let dedupeKey = null;
+      if (requestId) {
+        // A retry from a flaky phone connection must not create a second task.
+        dedupeKey = INGEST_REQUEST_PROPERTY_PREFIX + sha256Hex_(requestId);
+        const previous = properties.getProperty(dedupeKey);
+        if (previous) {
+          const record = JSON.parse(previous);
+          if (Date.now() - record.at < INGEST_DEDUPE_MS) {
+            return jsonResponse_({
+              ok: true,
+              task_id: record.task_id,
+              duplicate: true,
+            });
+          }
+        }
+      }
+
+      const taskList = ensureAiInbox_();
+      const title = String(request.title || '').trim()
+        || rawText.slice(0, INGEST_TITLE_MAX);
+      const created = Tasks.Tasks.insert({title: title, notes: rawText}, taskList.id);
+
+      if (dedupeKey) {
+        properties.setProperty(
+          dedupeKey,
+          JSON.stringify({task_id: created.id, at: Date.now()})
+        );
+      }
+
+      // Signal immediately instead of waiting for the next poll.
+      let signalled = true;
+      try {
+        pollTasksAndSignalUnlocked_();
+      } catch (signalError) {
+        // The task is already saved, so the periodic poll will retry the
+        // signal. Report it rather than failing the whole ingest.
+        signalled = false;
+      }
+      return jsonResponse_({
+        ok: true,
+        task_id: created.id,
+        task_list_id: taskList.id,
+        signalled: signalled,
+        duplicate: false,
+      });
     }
 
     if (request.action === 'calendar_delete') {

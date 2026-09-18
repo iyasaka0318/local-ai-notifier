@@ -114,6 +114,21 @@ class TasksInboxClient:
             payload["task_list_id"] = list_id
         self._post(payload)
 
+    def ingest_text(self, text, title=None, request_id=None):
+        """Push one spoken memo straight into the AI Inbox.
+
+        This is the path a phone automation app uses instead of going through
+        an assistant that may reword the utterance. ``request_id`` makes a
+        retry safe: the same id inside the dedupe window returns the original
+        task rather than creating a second one.
+        """
+        payload = {"action": "tasks_ingest", "text": text}
+        if title:
+            payload["title"] = title
+        if request_id:
+            payload["request_id"] = request_id
+        return self._post(payload)
+
     def get(self, task_id):
         for item in self.all():
             if item.id == task_id:
