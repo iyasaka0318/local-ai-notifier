@@ -1,0 +1,15 @@
+[project]
+name = "local-ai-notifier"
+version = "0.1.0"
+description = "Personal local AI automation system using Google Tasks, Qwen, and ntfy"
+requires-python = ">=3.11"
+dependencies = [
+    "ddgs",
+    "gkeepapi",
+    "gpsoauth",
+    "requests",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

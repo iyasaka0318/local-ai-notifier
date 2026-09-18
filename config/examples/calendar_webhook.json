@@ -1,0 +1,4 @@
+{
+  "endpoint_url": "https://script.google.com/macros/s/EXAMPLE/exec",
+  "secret": "REPLACE_WITH_SECRET"
+}

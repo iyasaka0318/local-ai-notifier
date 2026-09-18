@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local secrets and machine-specific configuration
+config/*.json
+!config/examples/
+!config/examples/*.json
+
+# Runtime state and generated artifacts
+data/
+backups/
+logs/
+runtime/
+
+# Legacy locations (kept ignored during staged migrations)
+/google_calendar_client_secret.json
+/google_calendar_token.json
+/keep_credentials.json
+/calendar_webhook.json
+/tasks_event.json
+/keep_state*.db
+*.log
+*.lock
