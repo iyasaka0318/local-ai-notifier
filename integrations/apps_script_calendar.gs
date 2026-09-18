@@ -18,6 +18,7 @@ const TASKS_TRIGGER_INSTALL_STAGGER_MS = 15 * 1000;
 const INGEST_REQUEST_PROPERTY_PREFIX = 'INGEST_';
 const INGEST_DEDUPE_MS = 10 * 60 * 1000;
 const INGEST_TITLE_MAX = 40;
+const AI_TASK_LIST_ID_PROPERTY = 'AI_TASK_LIST_ID';
 
 function doPost(e) {
   let lock = null;
@@ -151,10 +152,10 @@ function doPost(e) {
         }
       }
 
-      const taskList = ensureAiInbox_();
+      const taskListId = aiInboxListId_(properties);
       const title = String(request.title || '').trim()
         || rawText.slice(0, INGEST_TITLE_MAX);
-      const created = Tasks.Tasks.insert({title: title, notes: rawText}, taskList.id);
+      const created = Tasks.Tasks.insert({title: title, notes: rawText}, taskListId);
 
       if (dedupeKey) {
         properties.setProperty(
@@ -163,19 +164,18 @@ function doPost(e) {
         );
       }
 
-      // Signal immediately instead of waiting for the next poll.
-      let signalled = true;
+      // Signal immediately instead of waiting for the next poll. The task is
+      // already stored, so a signal failure only costs latency, never data.
+      let signalled = false;
       try {
-        pollTasksAndSignalUnlocked_();
+        signalled = sendTasksSignalDirect_(properties);
       } catch (signalError) {
-        // The task is already saved, so the periodic poll will retry the
-        // signal. Report it rather than failing the whole ingest.
         signalled = false;
       }
       return jsonResponse_({
         ok: true,
         task_id: created.id,
-        task_list_id: taskList.id,
+        task_list_id: taskListId,
         signalled: signalled,
         duplicate: false,
       });
@@ -305,6 +305,45 @@ function pollTasksAndSignal() {
     }
     lock.releaseLock();
   }
+}
+
+/**
+ * 取り込み直後に使う軽量シグナル。
+ * pollTasksAndSignalUnlocked_ と違い、全タスクリストの再走査を行いません。
+ * 新しいタスクを作った直後なので「未処理がある」ことは自明で、
+ * 走査を挟むと応答が数十秒に伸びて呼び出し側がタイムアウトします。
+ */
+function sendTasksSignalDirect_(properties) {
+  const signalUrl = properties.getProperty(TASKS_SIGNAL_URL_PROPERTY);
+  if (!signalUrl) return false;
+
+  const response = UrlFetchApp.fetch(signalUrl, {
+    method: 'post',
+    contentType: 'text/plain; charset=utf-8',
+    payload: 'tasks_changed',
+    headers: {
+      'Title': 'AI Inbox signal',
+      'Priority': '3',
+    },
+    muteHttpExceptions: true,
+  });
+  const status = response.getResponseCode();
+  if (status < 200 || status >= 300) return false;
+
+  // 状態ハッシュは意図的に更新しません。算出には避けたい全走査が必要で、
+  // 次回ポーリングが一度だけ重複合図を送るほうが安上がりです。
+  // 重複合図は処理済みタスクを再走査するだけで副作用はありません。
+  properties.setProperty(TASKS_SIGNAL_LAST_SENT_PROPERTY, String(Date.now()));
+  return true;
+}
+
+/** AI Inbox のリストIDをキャッシュし、毎回の全リスト走査を避けます。 */
+function aiInboxListId_(properties) {
+  const cached = properties.getProperty(AI_TASK_LIST_ID_PROPERTY);
+  if (cached) return cached;
+  const taskList = ensureAiInbox_();
+  properties.setProperty(AI_TASK_LIST_ID_PROPERTY, taskList.id);
+  return taskList.id;
 }
 
 function pollTasksAndSignalUnlocked_() {

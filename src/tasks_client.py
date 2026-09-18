@@ -8,6 +8,7 @@ import requests
 from project_paths import CONFIG_DIR
 
 TASK_ID_PREFIX = "tasks:"
+INGEST_TIMEOUT_SECONDS = 60
 WEBHOOK_CONFIG_FILE = os.environ.get(
     "GOOGLE_CALENDAR_WEBHOOK_CONFIG_FILE",
     str(CONFIG_DIR / "calendar_webhook.json"),
@@ -60,7 +61,7 @@ class TasksInboxClient:
             raise RuntimeError("Apps Scriptの設定がありません")
         self.session = session
 
-    def _post(self, payload):
+    def _post(self, payload, timeout=30):
         request = dict(payload)
         request["secret"] = self.credentials["secret"]
         response = None
@@ -68,7 +69,7 @@ class TasksInboxClient:
             response = self.session.post(
                 self.credentials["endpoint_url"],
                 json=request,
-                timeout=30,
+                timeout=timeout,
             )
             if response.status_code not in {404, 429, 500, 502, 503, 504}:
                 break
@@ -127,7 +128,11 @@ class TasksInboxClient:
             payload["title"] = title
         if request_id:
             payload["request_id"] = request_id
-        return self._post(payload)
+        # Apps Script can take longer than a plain read under trigger
+        # contention, and a client-side timeout here is worse than waiting:
+        # the task is created either way, so giving up early only hides a
+        # success and invites a duplicate on retry.
+        return self._post(payload, timeout=INGEST_TIMEOUT_SECONDS)
 
     def get(self, task_id):
         for item in self.all():
