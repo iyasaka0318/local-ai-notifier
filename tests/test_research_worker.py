@@ -180,6 +180,18 @@ class ResearchWorkerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             research_worker.validate_public_url("http://127.0.0.1/private")
 
+    def test_body_without_header_charset_uses_detected_encoding(self):
+        class Response:
+            headers = {"content-type": "text/html"}
+            encoding = "ISO-8859-1"
+            apparent_encoding = "utf-8"
+
+        text = "発売日は10月3日です"
+        self.assertEqual(
+            research_worker.decode_response_body(Response(), text.encode("utf-8")),
+            text,
+        )
+
     def test_english_output_is_rewritten_before_delivery(self):
         english = {
             "result_text": "Detailed research result",

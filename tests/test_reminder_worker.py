@@ -10,6 +10,7 @@ from reminder_worker import (
     dispatch_persistent_reminders,
 )
 from state_store import ensure_schema
+from state_store import cancel_reminders
 
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -75,6 +76,28 @@ class ReminderWorkerTests(unittest.TestCase):
         """).fetchone()
         self.assertEqual(count, 0)
         self.assertEqual(row, ("pending", "offline"))
+
+    def test_concurrent_cancellation_is_not_overwritten_after_delivery(self):
+        self.add_reminder("due", "2026-09-17T07:59:00+09:00")
+
+        def cancel_during_delivery(_topic, _summary, _title):
+            cancel_reminders(self.conn, ["due"])
+            self.conn.commit()
+
+        count = dispatch_due_reminders(
+            self.conn,
+            "secret-topic",
+            now=datetime(2026, 9, 17, 8, 0, tzinfo=JST),
+            sender=cancel_during_delivery,
+        )
+
+        self.assertEqual(count, 0)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT status FROM reminders WHERE note_id = 'due'"
+            ).fetchone()[0],
+            "cancelled",
+        )
 
     def test_weekly_reminder_is_rescheduled(self):
         self.conn.execute("""

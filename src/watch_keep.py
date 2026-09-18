@@ -8,9 +8,10 @@ from datetime import datetime
 
 from ai_memo import is_ready_to_trash, parse_ai_memo, trash_processed_ai_memo
 from automation_config import OLLAMA_THINK, VAGUE_TIMES
+from classification_output import rewrite_classification_output
 from instance_lock import SingleInstanceLock
 from inbox_client import get_inbox_client
-from output_policy import infer_research_notification_mode, needs_japanese_rewrite
+from output_policy import infer_research_notification_mode
 from persistent_reminders import (
     add_task as add_persistent_task,
     complete_task as complete_persistent_task,
@@ -45,6 +46,9 @@ if hasattr(sys.stderr, "reconfigure"):
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "qwen3:14b"
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+if not NTFY_TOPIC:
+    raise RuntimeError("NTFY_TOPIC is required")
 
 
 def mark_note_failed(conn, note_id, content_hash, error):
@@ -52,7 +56,7 @@ def mark_note_failed(conn, note_id, content_hash, error):
     store_mark_note_failed(conn, note_id, content_hash, error)
     notify_processing_failure(
         conn,
-        os.environ.get("NTFY_TOPIC"),
+        NTFY_TOPIC,
         "AIメモの受付・分類",
         note_id,
         error,
@@ -88,6 +92,7 @@ def ask_ollama(system_prompt, user_data, schema):
             }
         ],
         "format": schema,
+        "keep_alive": "30m",
         "think": OLLAMA_THINK,
         "stream": False,
         "options": {
@@ -424,55 +429,24 @@ All user-facing natural-language output must be Japanese.
 """
 
 
-JAPANESE_REWRITE_SCHEMA = {
-    "type": "object",
-    "properties": {"text": {"type": "string"}},
-    "required": ["text"],
-}
-
 JAPANESE_REWRITE_PROMPT = """
-Translate or rewrite the supplied text into natural Japanese. Preserve every fact,
-number, date, proper noun, product name, and URL exactly; do not add information.
-Return only the JSON schema. The text value must be Japanese prose.
+Rewrite every user-facing prose field that is not already Japanese into natural
+Japanese. Preserve every fact, number, date, proper noun, product name, URL, array
+length, null value, and all routing or automation fields exactly. Do not add facts.
+Return the same JSON structure using the supplied schema.
 ユーザー向けの文章は必ず日本語で生成してください。
 """
 
 
-def ensure_japanese_text(text):
-    if not text or not needs_japanese_rewrite(text):
-        return text
-    rewritten = ask_ollama(
-        JAPANESE_REWRITE_PROMPT,
-        {"text": text},
-        JAPANESE_REWRITE_SCHEMA,
-    )["text"].strip()
-    return rewritten or text
-
-
 def ensure_classification_japanese(result):
-    result["summary"] = ensure_japanese_text(result.get("summary", ""))
-    if result.get("notification_text"):
-        result["notification_text"] = ensure_japanese_text(
-            result["notification_text"]
-        )
-    for field in ("event_title", "event_location", "event_description"):
-        if result.get(field):
-            result[field] = ensure_japanese_text(result[field])
-    if result.get("persistent_task_text"):
-        result["persistent_task_text"] = ensure_japanese_text(
-            result["persistent_task_text"]
-        )
-    result["missing_information"] = [
-        ensure_japanese_text(item) for item in result.get("missing_information", [])
-    ]
-    for action in result.get("actions", []):
-        if action.get("objective"):
-            action["objective"] = ensure_japanese_text(action["objective"])
-        action["requested_items"] = [
-            ensure_japanese_text(item)
-            for item in action.get("requested_items", [])
-        ]
-    return result
+    return rewrite_classification_output(
+        result,
+        lambda value: ask_ollama(
+            JAPANESE_REWRITE_PROMPT,
+            value,
+            CLASSIFY_SCHEMA,
+        ),
+    )
 
 
 def should_process_unmarked(text):
@@ -790,7 +764,7 @@ print("Keep 接続OK")
 # 4. DB準備
 # =========================================================
 
-conn = sqlite3.connect(DB_PATH, timeout=30)
+conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
 cur = conn.cursor()
 ensure_schema(conn)
 
@@ -986,7 +960,7 @@ for note in notes:
             elif action == "notify_now":
                 create_notify_now_command(conn, note.id)
                 conn.commit()
-                dispatch_persistent_now(conn, os.environ["NTFY_TOPIC"], note.id)
+                dispatch_persistent_now(conn, NTFY_TOPIC, note.id)
             else:
                 raise ValueError("継続リマインドの操作を判定できませんでした")
         except Exception as e:
@@ -999,7 +973,7 @@ for note in notes:
             execute_web_monitor_management(
                 conn,
                 result,
-                os.environ["NTFY_TOPIC"],
+                NTFY_TOPIC,
             )
         except Exception as e:
             conn.rollback()
@@ -1011,7 +985,7 @@ for note in notes:
             execute_reminder_management(
                 conn,
                 result,
-                os.environ["NTFY_TOPIC"],
+                NTFY_TOPIC,
             )
         except Exception as e:
             conn.rollback()

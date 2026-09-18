@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from instance_lock import SingleInstanceLock
@@ -14,6 +15,7 @@ from state_store import (
     mark_note_failed,
     mark_note_processed,
     note_content_hash,
+    requeue_stale_running_jobs,
     save_structured_item,
     upsert_web_monitor,
     upsert_research_job,
@@ -52,6 +54,32 @@ class StateStoreTests(unittest.TestCase):
         mark_note_failed(self.conn, "n1", second_hash, "temporary error")
         self.assertTrue(claim_note(self.conn, "n1", second_hash))
 
+    def test_only_stale_running_jobs_are_requeued(self):
+        now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+        old = (now - timedelta(hours=1)).isoformat()
+        recent = (now - timedelta(minutes=5)).isoformat()
+        self.conn.executemany("""
+            INSERT INTO wake_jobs (note_id, status, created_at, updated_at)
+            VALUES (?, 'running', ?, ?)
+        """, (("old", old, old), ("recent", recent, recent)))
+        self.conn.commit()
+
+        self.assertEqual(
+            requeue_stale_running_jobs(self.conn, "wake_jobs", now=now),
+            1,
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT status FROM wake_jobs WHERE note_id = 'old'"
+            ).fetchone()[0],
+            "retry",
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT status FROM wake_jobs WHERE note_id = 'recent'"
+            ).fetchone()[0],
+            "running",
+        )
     def test_structured_items_upsert_and_supersede(self):
         cursor = self.conn.cursor()
         save_structured_item(cursor, "n1", "t", "body", result("todo"))

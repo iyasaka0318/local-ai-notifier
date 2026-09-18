@@ -2,14 +2,16 @@ import os
 import json
 import sqlite3
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
 from urllib.parse import urlparse
 from ddgs import DDGS
 from datetime import datetime
 from failure_notifier import notify_processing_failure
 from automation_config import OLLAMA_THINK
+from instance_lock import SingleInstanceLock
 from state_store import ensure_schema
-from project_paths import DB_PATH, ensure_runtime_directories
+from project_paths import DB_PATH, RUNTIME_DIR, ensure_runtime_directories
 
 
 # =========================================================
@@ -50,6 +52,7 @@ def ask_ollama(system_prompt, user_data, schema):
             }
         ],
         "format": schema,
+        "keep_alive": "30m",
         "think": OLLAMA_THINK,
         "stream": False,
         "options": {
@@ -233,58 +236,48 @@ def get_known_domains(monitor_urls_json):
 # =========================================================
 
 def search_web(queries):
+    def run_query(query):
+        try:
+            return query, list(DDGS().text(query, max_results=8))
+        except Exception as error:
+            print("検索失敗:")
+            print(error)
+            return query, []
 
     by_url = {}
+    if not queries:
+        return []
+    with ThreadPoolExecutor(max_workers=min(4, len(queries))) as executor:
+        for query, results in executor.map(run_query, queries):
+            print()
+            print("検索:")
+            print(query)
+            for result in results:
 
-    for query in queries:
-
-        print()
-        print("検索:")
-        print(query)
-
-        try:
-
-            results = list(
-                DDGS().text(
-                    query,
-                    max_results=8
-                )
-            )
-
-        except Exception as e:
-
-            print("検索失敗:")
-            print(e)
-
-            continue
-
-
-        for result in results:
-
-            url = result.get(
-                "href",
-                ""
-            ).strip()
-
-            if not url:
-                continue
-
-            # URL単位で重複除去
-            if url in by_url:
-                continue
-
-            by_url[url] = {
-                "title": result.get(
-                    "title",
+                url = result.get(
+                    "href",
                     ""
-                ),
-                "url": url,
-                "description": result.get(
-                    "body",
-                    ""
-                ),
-                "found_by_query": query
-            }
+                ).strip()
+
+                if not url:
+                    continue
+
+                # URL単位で重複除去
+                if url in by_url:
+                    continue
+
+                by_url[url] = {
+                    "title": result.get(
+                        "title",
+                        ""
+                    ),
+                    "url": url,
+                    "description": result.get(
+                        "body",
+                        ""
+                    ),
+                    "found_by_query": query
+                }
 
 
     candidates = []
@@ -409,6 +402,11 @@ def judge_results(
 # =========================================================
 
 ensure_runtime_directories()
+instance_lock = SingleInstanceLock(str(RUNTIME_DIR / "monitor_worker.lock"))
+if not instance_lock.acquire():
+    print("Web monitor worker is already running; this invocation will exit.")
+    raise SystemExit(0)
+
 conn = sqlite3.connect(
     DB_PATH,
     timeout=30,
@@ -692,6 +690,20 @@ for (
 
         found = candidates[idx]
 
+        # Claim completion before notification. If the monitor was cancelled
+        # after the initial SELECT, this guarded transition fails and no stale
+        # notification is sent.
+        found_at = datetime.now().isoformat()
+        cur.execute("""
+        UPDATE web_monitors
+        SET status = 'found', found_url = ?, last_checked_at = ?
+        WHERE id = ? AND status = 'active'
+        """, (found["url"], found_at, job_id))
+        conn.commit()
+        if cur.rowcount == 0:
+            print("監視は既に取り消されているため通知をスキップします")
+            continue
+
 
         print()
         print("=" * 60)
@@ -739,6 +751,15 @@ for (
 
             print(e)
 
+            # Delivery did not happen, so make this exact claimed result
+            # eligible for a later retry without reviving a cancelled row.
+            cur.execute("""
+            UPDATE web_monitors
+            SET status = 'active', found_url = NULL
+            WHERE id = ? AND status = 'found' AND found_url = ?
+            """, (job_id, found["url"]))
+            conn.commit()
+
             notify_processing_failure(
                 conn, NTFY_TOPIC, "Web監視の完了通知", job_id, e, retrying=True
             )
@@ -747,25 +768,6 @@ for (
             # jobはactiveのまま
             continue
 
-
-        # -------------------------------------------------
-        # 通知成功後に完了
-        # -------------------------------------------------
-
-        cur.execute("""
-        UPDATE web_monitors
-        SET
-            status = 'found',
-            found_url = ?,
-            last_checked_at = ?
-        WHERE id = ?
-        """, (
-            found["url"],
-            datetime.now().isoformat(),
-            job_id
-        ))
-
-        conn.commit()
 
         print(
             "監視ジョブを完了しました"
@@ -786,7 +788,7 @@ for (
         cur.execute("""
         UPDATE web_monitors
         SET last_checked_at = ?
-        WHERE id = ?
+        WHERE id = ? AND status = 'active'
         """, (
             datetime.now().isoformat(),
             job_id

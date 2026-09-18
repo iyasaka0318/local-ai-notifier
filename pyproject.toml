@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Personal local AI automation system using Google Tasks, Qwen, and ntfy"
 requires-python = ">=3.11"
 dependencies = [
+    "charset-normalizer",
     "ddgs",
     "gkeepapi",
     "gpsoauth",

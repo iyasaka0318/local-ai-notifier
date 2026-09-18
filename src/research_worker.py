@@ -4,12 +4,14 @@ import os
 import re
 import socket
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
+from charset_normalizer import from_bytes
 from ddgs import DDGS
 
 from failure_notifier import notify_processing_failure
@@ -26,7 +28,12 @@ from tasks_client import get_tasks_inbox_client
 from output_policy import needs_japanese_rewrite
 from project_paths import DB_PATH, RUNTIME_DIR, ensure_runtime_directories
 from reminder_worker import parse_scheduled_at, send_notification
-from state_store import ensure_schema, mark_note_processed, utc_now
+from state_store import (
+    ensure_schema,
+    mark_note_processed,
+    requeue_stale_running_jobs,
+    utc_now,
+)
 
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
@@ -68,6 +75,7 @@ def ask_ollama(system_prompt, user_data, schema):
                 {"role": "user", "content": json.dumps(user_data, ensure_ascii=False)},
             ],
             "format": schema,
+            "keep_alive": "30m",
             "think": OLLAMA_THINK,
             "stream": False,
             "options": {"temperature": 0.1},
@@ -181,10 +189,18 @@ def build_queries(objective, requested_items, base_query):
 
 
 def search_web(queries):
-    by_url = {}
-    for query in queries:
+    def run_query(query):
         try:
-            results = DDGS().text(query, max_results=8)
+            return query, list(DDGS().text(query, max_results=8))
+        except Exception:
+            return query, []
+
+    by_url = {}
+    if not queries:
+        return []
+    with ThreadPoolExecutor(max_workers=min(4, len(queries))) as executor:
+        query_results = executor.map(run_query, queries)
+        for query, results in query_results:
             for result in results:
                 url = (result.get("href") or "").strip()
                 if not url or url in by_url:
@@ -197,8 +213,6 @@ def search_web(queries):
                 }
                 if len(by_url) >= MAX_RESEARCH_RESULTS:
                     return list(by_url.values())
-        except Exception:
-            continue
     return list(by_url.values())
 
 
@@ -213,6 +227,19 @@ def validate_public_url(url):
         address = ipaddress.ip_address(info[4][0])
         if not address.is_global:
             raise ValueError("non-public URL is not allowed")
+
+
+def decode_response_body(response, raw):
+    content_type = response.headers.get("content-type", "").lower()
+    if "charset=" in content_type and response.encoding:
+        encoding = response.encoding
+    else:
+        match = from_bytes(raw).best()
+        encoding = match.encoding if match is not None else "utf-8"
+    try:
+        return raw.decode(encoding, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
 
 
 def fetch_page_text(url):
@@ -241,8 +268,7 @@ def fetch_page_text(url):
                 break
             chunks.append(chunk)
         raw = b"".join(chunks)
-        encoding = response.encoding or "utf-8"
-        decoded = raw.decode(encoding, errors="replace")
+        decoded = decode_response_body(response, raw)
         if "text/html" in content_type:
             parser = TextExtractor()
             parser.feed(decoded)
@@ -254,16 +280,23 @@ def fetch_page_text(url):
 def enrich_candidates(candidates):
     enriched = [dict(item) for item in candidates]
     fetched = 0
-    for item in enriched:
+    for offset in range(0, len(enriched), MAX_RESEARCH_PAGES):
         if fetched >= MAX_RESEARCH_PAGES:
             break
-        try:
-            final_url, page_text = fetch_page_text(item["url"])
-        except Exception:
-            continue
-        item["url"] = final_url
-        item["page_text"] = page_text
-        fetched += 1
+        batch = enriched[offset:offset + MAX_RESEARCH_PAGES]
+        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+            futures = [executor.submit(fetch_page_text, item["url"]) for item in batch]
+            for item, future in zip(batch, futures):
+                if fetched >= MAX_RESEARCH_PAGES:
+                    future.cancel()
+                    continue
+                try:
+                    final_url, page_text = future.result()
+                except Exception:
+                    continue
+                item["url"] = final_url
+                item["page_text"] = page_text
+                fetched += 1
     return enriched
 
 
@@ -507,6 +540,7 @@ def main():
     topic = os.environ["NTFY_TOPIC"]
     conn = sqlite3.connect(DB_PATH, timeout=30)
     ensure_schema(conn)
+    requeue_stale_running_jobs(conn, "research_jobs")
     jobs = conn.execute("""
         SELECT id, source_note_id, objective, query, requested_items, execute_at,
                save_to_keep, notify_mode, notify_at, result_text,

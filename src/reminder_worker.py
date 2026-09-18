@@ -74,13 +74,30 @@ def dispatch_persistent_reminders(conn, topic, now=None, sender=send_notificatio
             except (TypeError, ValueError):
                 pass
 
+        claimed_at = utc_now()
+        cursor = conn.execute("""
+            UPDATE persistent_reminders
+            SET last_notified_slot = ?, updated_at = ?
+            WHERE id = ? AND status = 'active' AND last_notified_slot IS ?
+        """, (slot.isoformat(), claimed_at, task_id, last_notified_slot))
+        conn.commit()
+        if cursor.rowcount == 0:
+            continue
+
         try:
             sender(topic, task_text, "リマインダー")
         except Exception as error:
             conn.execute("""
                 UPDATE persistent_reminders
-                SET last_error = ?, updated_at = ? WHERE id = ?
-            """, (str(error)[:2000], utc_now(), task_id))
+                SET last_notified_slot = ?, last_error = ?, updated_at = ?
+                WHERE id = ? AND status = 'active' AND last_notified_slot = ?
+            """, (
+                last_notified_slot,
+                str(error)[:2000],
+                utc_now(),
+                task_id,
+                slot.isoformat(),
+            ))
             conn.commit()
             notify_processing_failure(
                 conn, topic, "継続リマインダー通知", task_id, error,
@@ -88,12 +105,11 @@ def dispatch_persistent_reminders(conn, topic, now=None, sender=send_notificatio
             )
             continue
 
-        timestamp = utc_now()
         conn.execute("""
             UPDATE persistent_reminders
-            SET last_notified_slot = ?, last_error = NULL, updated_at = ?
-            WHERE id = ?
-        """, (slot.isoformat(), timestamp, task_id))
+            SET last_error = NULL, updated_at = ?
+            WHERE id = ? AND status = 'active' AND last_notified_slot = ?
+        """, (utc_now(), task_id, slot.isoformat()))
         conn.commit()
         sent += 1
     return sent
@@ -186,6 +202,14 @@ def dispatch_persistent_now(
 
 def dispatch_due_reminders(conn, topic, now=None, sender=send_notification):
     now = now or datetime.now(LOCAL_TIMEZONE)
+    stale_sending_before = (now - timedelta(minutes=5)).isoformat()
+    conn.execute("""
+        UPDATE reminders
+        SET status = 'pending', updated_at = ?
+        WHERE status = 'sending'
+          AND (updated_at IS NULL OR updated_at < ?)
+    """, (now.isoformat(), stale_sending_before))
+    conn.commit()
     rows = conn.execute("""
         SELECT note_id, title, summary, scheduled_at, recurrence, source_type
         FROM reminders
@@ -213,6 +237,16 @@ def dispatch_due_reminders(conn, topic, now=None, sender=send_notification):
         if due_at > now.astimezone(due_at.tzinfo):
             continue
 
+        claimed_at = utc_now()
+        cursor = conn.execute("""
+            UPDATE reminders
+            SET status = 'sending', last_error = NULL, updated_at = ?
+            WHERE note_id = ? AND status = 'pending'
+        """, (claimed_at, note_id))
+        conn.commit()
+        if cursor.rowcount == 0:
+            continue
+
         try:
             notification_title = (
                 title if source_type == "research" and title else "リマインダー"
@@ -221,8 +255,8 @@ def dispatch_due_reminders(conn, topic, now=None, sender=send_notification):
         except Exception as error:
             conn.execute("""
                 UPDATE reminders
-                SET last_error = ?, updated_at = ?
-                WHERE note_id = ?
+                SET status = 'pending', last_error = ?, updated_at = ?
+                WHERE note_id = ? AND status = 'sending'
             """, (str(error)[:2000], utc_now(), note_id))
             conn.commit()
             notify_processing_failure(
@@ -241,24 +275,25 @@ def dispatch_due_reminders(conn, topic, now=None, sender=send_notification):
             next_at = None
 
         if next_at is None:
-            conn.execute("""
+            final_cursor = conn.execute("""
                 UPDATE reminders
                 SET status = 'notified', notified_at = ?, last_error = NULL,
                     updated_at = ?
-                WHERE note_id = ?
+                WHERE note_id = ? AND status = 'sending'
             """, (timestamp, timestamp, note_id))
         else:
             step = timedelta(days=1 if recurrence == "daily" else 7)
             while next_at <= now.astimezone(next_at.tzinfo):
                 next_at += step
-            conn.execute("""
+            final_cursor = conn.execute("""
                 UPDATE reminders
                 SET status = 'pending', scheduled_at = ?, notified_at = ?,
                     last_error = NULL, updated_at = ?
-                WHERE note_id = ?
+                WHERE note_id = ? AND status = 'sending'
             """, (next_at.isoformat(), timestamp, timestamp, note_id))
         conn.commit()
-        sent += 1
+        if final_cursor.rowcount:
+            sent += 1
 
     return sent
 

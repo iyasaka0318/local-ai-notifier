@@ -47,7 +47,7 @@ class FailureNotifierTests(unittest.TestCase):
         self.assertNotIn("example.com", message)
         self.assertIn("自動再試行は行いません", message)
 
-    def test_notification_delivery_failure_does_not_raise_or_repeat(self):
+    def test_notification_delivery_failure_retries_after_short_cooldown(self):
         calls = []
 
         def broken_sender(*args):
@@ -63,7 +63,11 @@ class FailureNotifierTests(unittest.TestCase):
             self.conn, "topic", "処理", "x", RuntimeError("failed"),
             sender=broken_sender, now=now + timedelta(minutes=1),
         ))
-        self.assertEqual(len(calls), 1)
+        self.assertFalse(notify_processing_failure(
+            self.conn, "topic", "処理", "x", RuntimeError("failed"),
+            sender=broken_sender, now=now + timedelta(minutes=6),
+        ))
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

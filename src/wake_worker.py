@@ -14,7 +14,12 @@ from instance_lock import SingleInstanceLock
 from keep_client import get_authenticated_keep
 from project_paths import DB_PATH, RUNTIME_DIR, ensure_runtime_directories
 from reminder_worker import latest_persistent_slot, parse_scheduled_at, send_notification
-from state_store import ensure_schema, mark_note_processed, utc_now
+from state_store import (
+    ensure_schema,
+    mark_note_processed,
+    requeue_stale_running_jobs,
+    utc_now,
+)
 from tasks_client import get_tasks_inbox_client
 
 
@@ -336,6 +341,7 @@ def main():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
         ensure_schema(conn)
+        requeue_stale_running_jobs(conn, "wake_jobs")
         jobs = conn.execute("""
             SELECT note_id FROM wake_jobs
             WHERE status IN ('pending', 'retry')

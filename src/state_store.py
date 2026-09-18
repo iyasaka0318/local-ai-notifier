@@ -1,12 +1,13 @@
 import hashlib
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 VALID_PROCESSING_STATUSES = {
     "new", "processing", "waiting_downstream", "processed", "failed"
 }
+RECOVERABLE_JOB_TABLES = {"research_jobs", "calendar_jobs", "wake_jobs"}
 
 
 def utc_now():
@@ -35,6 +36,8 @@ def ensure_schema(conn):
     """Create or migrate the local schema without deleting existing data."""
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA journal_mode = WAL")
+    if not conn.in_transaction:
+        conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS processed_notes (
             note_id TEXT PRIMARY KEY
@@ -267,10 +270,12 @@ def ensure_schema(conn):
             error_summary TEXT NOT NULL,
             first_seen_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL,
+            last_attempted_at TEXT,
             last_notified_at TEXT,
             occurrence_count INTEGER NOT NULL DEFAULT 1
         )
     """)
+    _add_column(conn, "failure_notifications", "last_attempted_at TEXT")
 
     now = utc_now()
     conn.execute("""
@@ -344,7 +349,43 @@ def ensure_schema(conn):
             now=row[10] or now,
         )
 
+    for table_name in (
+        "web_monitors",
+        "reminders",
+        "research_jobs",
+        "calendar_jobs",
+        "wake_jobs",
+    ):
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table_name}_status "
+            f"ON {table_name} (status)"
+        )
+
     conn.commit()
+
+
+def requeue_stale_running_jobs(
+    conn,
+    table_name,
+    *,
+    now=None,
+    stale_after=timedelta(minutes=30),
+):
+    """Return interrupted jobs to retry without touching live recent work."""
+    if table_name not in RECOVERABLE_JOB_TABLES:
+        raise ValueError(f"unsupported recoverable job table: {table_name}")
+    now = now or datetime.now().astimezone()
+    cutoff = (now - stale_after).isoformat()
+    cursor = conn.execute(f"""
+        UPDATE {table_name}
+        SET status = 'retry',
+            last_error = COALESCE(last_error, '前回の処理中断を検出しました'),
+            updated_at = ?
+        WHERE status = 'running'
+          AND (updated_at IS NULL OR updated_at < ?)
+    """, (now.isoformat(), cutoff))
+    conn.commit()
+    return cursor.rowcount
 
 
 def claim_note(conn, note_id, content_hash, updated_at=None):
@@ -776,7 +817,7 @@ def list_pending_reminders(conn):
 
 
 def cancel_reminders(conn, target_note_ids):
-    """Cancel only pending reminders and return the affected records."""
+    """Cancel pending reminders, including ones claimed for immediate sending."""
     normalized_ids = sorted({str(value) for value in target_note_ids if value})
     if not normalized_ids:
         return []
@@ -785,7 +826,7 @@ def cancel_reminders(conn, target_note_ids):
         f"""
         SELECT note_id, summary, scheduled_at, recurrence
         FROM reminders
-        WHERE status = 'pending' AND note_id IN ({placeholders})
+        WHERE status IN ('pending', 'sending') AND note_id IN ({placeholders})
         ORDER BY scheduled_at, note_id
         """,
         normalized_ids,
@@ -798,7 +839,7 @@ def cancel_reminders(conn, target_note_ids):
         f"""
         UPDATE reminders
         SET status = 'cancelled', last_error = NULL, updated_at = ?
-        WHERE status = 'pending' AND note_id IN ({found_placeholders})
+        WHERE status IN ('pending', 'sending') AND note_id IN ({found_placeholders})
         """,
         [utc_now(), *found_ids],
     )

@@ -9,6 +9,7 @@ from state_store import utc_now
 
 NTFY_URL = "https://ntfy.sh"
 DEFAULT_COOLDOWN = timedelta(hours=6)
+FAILED_DELIVERY_RETRY = timedelta(minutes=5)
 
 
 def _clean_error(error):
@@ -84,7 +85,8 @@ def notify_processing_failure(
         f"{component}\0{item_id}\0{error_type}\0{summary}".encode("utf-8")
     ).hexdigest()
     row = conn.execute(
-        "SELECT last_notified_at FROM failure_notifications WHERE fingerprint = ?",
+        """SELECT last_notified_at, last_attempted_at
+           FROM failure_notifications WHERE fingerprint = ?""",
         (fingerprint,),
     ).fetchone()
     should_notify = True
@@ -96,20 +98,32 @@ def notify_processing_failure(
             should_notify = now - last_notified.astimezone(now.tzinfo) >= cooldown
         except (TypeError, ValueError):
             pass
+    if should_notify and row and row[1]:
+        try:
+            last_attempted = datetime.fromisoformat(row[1])
+            if last_attempted.tzinfo is None:
+                last_attempted = last_attempted.replace(tzinfo=now.tzinfo)
+            should_notify = (
+                now - last_attempted.astimezone(now.tzinfo)
+                >= FAILED_DELIVERY_RETRY
+            )
+        except (TypeError, ValueError):
+            pass
 
     timestamp = now.isoformat()
     conn.execute("""
         INSERT INTO failure_notifications (
             fingerprint, component, item_id, error_type, error_summary,
-            first_seen_at, last_seen_at, last_notified_at, occurrence_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            first_seen_at, last_seen_at, last_attempted_at,
+            last_notified_at, occurrence_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)
         ON CONFLICT(fingerprint) DO UPDATE SET
             last_seen_at = excluded.last_seen_at,
             occurrence_count = failure_notifications.occurrence_count + 1,
-            last_notified_at = CASE
-                WHEN excluded.last_notified_at IS NOT NULL
-                THEN excluded.last_notified_at
-                ELSE failure_notifications.last_notified_at
+            last_attempted_at = CASE
+                WHEN excluded.last_attempted_at IS NOT NULL
+                THEN excluded.last_attempted_at
+                ELSE failure_notifications.last_attempted_at
             END
     """, (
         fingerprint,
@@ -139,4 +153,10 @@ def notify_processing_failure(
         # ntfy障害を通知しようとして無限再帰・大量送信しない。
         print(f"Failure notification could not be sent: {_clean_error(notify_error)}")
         return False
+    conn.execute("""
+        UPDATE failure_notifications
+        SET last_notified_at = ?
+        WHERE fingerprint = ?
+    """, (timestamp, fingerprint))
+    conn.commit()
     return True

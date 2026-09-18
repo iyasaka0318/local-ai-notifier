@@ -14,7 +14,12 @@ from keep_client import get_authenticated_keep
 from project_paths import CONFIG_DIR, DB_PATH, RUNTIME_DIR, ensure_runtime_directories
 from tasks_client import get_tasks_inbox_client
 from reminder_worker import parse_scheduled_at
-from state_store import ensure_schema, mark_note_processed, utc_now
+from state_store import (
+    ensure_schema,
+    mark_note_processed,
+    requeue_stale_running_jobs,
+    utc_now,
+)
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -302,6 +307,7 @@ def main():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
         ensure_schema(conn)
+        requeue_stale_running_jobs(conn, "calendar_jobs")
         jobs = conn.execute("""
             SELECT note_id, event_title, event_start, event_end, all_day,
                    event_location, event_description
