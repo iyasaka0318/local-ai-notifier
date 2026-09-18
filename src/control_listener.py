@@ -12,12 +12,12 @@ import time
 
 import requests
 
-from action_log import run_pending_calendar_deletes, undo_action
+from action_log import undo_action
 from calendar_worker import delete_calendar_event
 from project_paths import DB_PATH
 from reminder_worker import send_notification
 from report_notifier import control_topic
-from state_store import ensure_schema
+from state_store import drain_remote_deletes, ensure_schema
 
 
 NTFY_URL = "https://ntfy.sh"
@@ -44,19 +44,22 @@ def parse_command(message):
 def handle_undo(conn, topic, tokens, sender=send_notification,
                 calendar_deleter=delete_calendar_event):
     messages = []
-    pending_deletes = []
     for token in tokens:
         try:
-            _ok, message = undo_action(conn, token, pending_deletes)
+            _ok, message = undo_action(conn, token)
         except Exception as error:
             message = f"取り消しに失敗しました: {error}"
         messages.append(message)
     conn.commit()
 
-    # Remote deletes happen after the local state is durable, so a network
-    # failure cannot leave the cancellation half-applied.
-    for error in run_pending_calendar_deletes(pending_deletes, calendar_deleter):
-        messages.append(f"カレンダーからの削除に失敗しました: {error}")
+    # Remote deletes run after the local state is durable. Anything that fails
+    # stays queued, so the next tap or the next worker pass retries it rather
+    # than losing it with this process.
+    _done, failed = drain_remote_deletes(conn, "calendar", calendar_deleter)
+    if failed:
+        messages.append(
+            f"カレンダーからの削除が{failed}件残っています。自動で再試行します。"
+        )
 
     sender(topic, "\n".join(messages), "取り消しました")
     return messages

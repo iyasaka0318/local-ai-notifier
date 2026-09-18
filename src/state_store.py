@@ -332,6 +332,30 @@ def ensure_schema(conn):
             f"ON {table_name} (source_note_id)"
         )
 
+    # A cancellation that has to reach Google is not finished when the local
+    # row flips. Keeping the outstanding delete in the database is what lets a
+    # failed or interrupted delete be retried instead of being lost with the
+    # process that attempted it.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pending_remote_deletes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            remote_id TEXT NOT NULL,
+            token TEXT,
+            requested_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at TEXT,
+            last_error TEXT,
+            completed_at TEXT,
+            UNIQUE(kind, item_id, remote_id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_pending_deletes_open
+        ON pending_remote_deletes (completed_at, last_attempt_at)
+    """)
+
     _add_column(conn, "persistent_reminders", "group_name TEXT")
     _add_column(conn, "web_monitors", "notified_at TEXT")
 
@@ -1053,3 +1077,82 @@ def requeue_stale_found_monitors(conn, now=None, stale_after=timedelta(minutes=1
     """, (cutoff,))
     conn.commit()
     return cursor.rowcount
+
+
+# =========================================================
+# Outstanding remote deletions
+# =========================================================
+
+def enqueue_remote_delete(conn, kind, item_id, remote_id, token=None, now=None):
+    """Record that something still has to be removed from an external service."""
+    conn.execute("""
+        INSERT INTO pending_remote_deletes (
+            kind, item_id, remote_id, token, requested_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(kind, item_id, remote_id) DO UPDATE SET
+            completed_at = NULL,
+            token = COALESCE(excluded.token, pending_remote_deletes.token)
+    """, (kind, item_id, remote_id, token, now or utc_now()))
+
+
+def open_remote_deletes(conn, kind=None, limit=20):
+    sql = """
+        SELECT id, kind, item_id, remote_id, attempts, last_error
+        FROM pending_remote_deletes
+        WHERE completed_at IS NULL
+    """
+    params = []
+    if kind:
+        sql += " AND kind = ?"
+        params.append(kind)
+    sql += " ORDER BY requested_at LIMIT ?"
+    params.append(limit)
+    return [
+        {
+            "id": row[0], "kind": row[1], "item_id": row[2],
+            "remote_id": row[3], "attempts": row[4], "last_error": row[5],
+        }
+        for row in conn.execute(sql, params).fetchall()
+    ]
+
+
+def mark_remote_delete_done(conn, delete_id, now=None):
+    conn.execute(
+        "UPDATE pending_remote_deletes SET completed_at = ?, last_error = NULL "
+        "WHERE id = ?",
+        (now or utc_now(), delete_id),
+    )
+    conn.commit()
+
+
+def mark_remote_delete_failed(conn, delete_id, error, now=None):
+    timestamp = now or utc_now()
+    conn.execute("""
+        UPDATE pending_remote_deletes
+        SET attempts = attempts + 1, last_attempt_at = ?, last_error = ?
+        WHERE id = ?
+    """, (timestamp, str(error)[:2000], delete_id))
+    conn.commit()
+
+
+def has_open_remote_delete(conn, kind, item_id):
+    return conn.execute("""
+        SELECT 1 FROM pending_remote_deletes
+        WHERE kind = ? AND item_id = ? AND completed_at IS NULL
+    """, (kind, item_id)).fetchone() is not None
+
+
+def drain_remote_deletes(conn, kind, deleter, limit=20):
+    """Retry outstanding deletions. Returns (done, failed)."""
+    done = 0
+    failed = 0
+    for entry in open_remote_deletes(conn, kind, limit):
+        try:
+            deleter(entry["item_id"], entry["remote_id"])
+        except Exception as error:
+            mark_remote_delete_failed(conn, entry["id"], error)
+            failed += 1
+            continue
+        mark_remote_delete_done(conn, entry["id"])
+        done += 1
+    return done, failed

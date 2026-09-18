@@ -14,7 +14,11 @@ trail of what the classifier actually decided.
 
 import secrets
 
-from state_store import utc_now
+from state_store import (
+    enqueue_remote_delete,
+    has_open_remote_delete,
+    utc_now,
+)
 
 
 # Kinds are also the notification grouping key, so keep them user-meaningful.
@@ -190,28 +194,31 @@ def _undo_research(conn, item_id):
     return cursor.rowcount > 0
 
 
-def _undo_calendar(conn, item_id, pending_calendar_deletes):
+def _undo_calendar(conn, item_id, pending_calendar_deletes=None):
     row = conn.execute("""
         SELECT status, calendar_event_id FROM calendar_jobs WHERE note_id = ?
     """, (item_id,)).fetchone()
     if row is None:
         return False
     status, calendar_event_id = row
-    if status == 'cancelled':
-        return False
+    already_cancelled = status == 'cancelled'
     # Cancel locally first so a worker cannot re-create the event while the
     # remote delete is in flight.
     conn.execute("""
         UPDATE calendar_jobs SET status = 'cancelled', last_error = NULL, updated_at = ?
         WHERE note_id = ?
     """, (utc_now(), item_id))
-    if calendar_event_id and pending_calendar_deletes is not None:
-        pending_calendar_deletes.append((item_id, calendar_event_id))
-    return True
+    if calendar_event_id:
+        # The queue is what makes the deletion survive a failed request, a
+        # closed process, or a second tap: an in-memory list would lose it.
+        enqueue_remote_delete(conn, "calendar", item_id, calendar_event_id)
+        if pending_calendar_deletes is not None:
+            pending_calendar_deletes.append((item_id, calendar_event_id))
+    return not already_cancelled
 
 
 def run_pending_calendar_deletes(pending, deleter):
-    """Run the deferred remote deletes once the local transaction is durable."""
+    """Best-effort immediate pass. The queue still owns the retry."""
     errors = []
     for item_id, event_id in pending or ():
         try:
@@ -233,6 +240,15 @@ def undo_action(conn, token, pending_calendar_deletes=None, now=None):
     if action is None:
         return False, "対象の操作が見つかりませんでした。"
     if action["undone"]:
+        if action["kind"] == "calendar" and has_open_remote_delete(
+            conn, "calendar", action["target_key"]
+        ):
+            # Locally cancelled, but Google still has the event. Saying
+            # "already undone" here would strand it permanently.
+            return True, (
+                f"取り消し済みですが、カレンダーからの削除が未完了です。"
+                f"再試行します: {action['summary']}"
+            )
         return True, f"すでに取り消し済みです: {action['summary']}"
 
     # Item ids are positional within a note, so a re-classification can put a

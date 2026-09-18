@@ -15,6 +15,8 @@ from project_paths import CONFIG_DIR, DB_PATH, RUNTIME_DIR, ensure_runtime_direc
 from tasks_client import get_tasks_inbox_client
 from reminder_worker import parse_scheduled_at
 from state_store import (
+    drain_remote_deletes,
+    enqueue_remote_delete,
     ensure_schema,
     mark_note_processed,
     source_note_has_outstanding_work,
@@ -307,12 +309,16 @@ def process_calendar_job(
         location, description,
     ) = job
     timestamp = utc_now()
-    conn.execute("""
+    # Claim the job instead of asserting it. A cancellation that landed after
+    # the job list was read must win, or the worker resurrects it.
+    cursor = conn.execute("""
         UPDATE calendar_jobs
         SET status = 'running', last_error = NULL, updated_at = ?
-        WHERE note_id = ?
+        WHERE note_id = ? AND status IN ('pending', 'retry', 'waiting_auth')
     """, (timestamp, note_id))
     conn.commit()
+    if cursor.rowcount == 0:
+        return
 
     body = build_event_body(
         note_id, event_title, event_start, event_end, bool(all_day),
@@ -326,6 +332,8 @@ def process_calendar_job(
         created = event_creator(access_token, CALENDAR_ID, body)
     calendar_event_id = created.get("id") or body["id"]
 
+    # Record the remote id even if the job was cancelled meanwhile: without it
+    # the event cannot be found and deleted.
     conn.execute("""
         UPDATE calendar_jobs
         SET calendar_event_id = ?, updated_at = ?
@@ -333,16 +341,27 @@ def process_calendar_job(
     """, (calendar_event_id, utc_now(), note_id))
     conn.commit()
 
-    finish_source_note(conn, note_id, keep_factory, tasks_factory)
     completed_at = utc_now()
-    conn.execute("""
+    finished = conn.execute("""
         UPDATE calendar_jobs
-        SET status = 'created', calendar_event_id = ?,
+        SET status = 'created',
             created_in_calendar_at = COALESCE(created_in_calendar_at, ?),
             last_error = NULL, updated_at = ?
-        WHERE note_id = ?
-    """, (calendar_event_id, completed_at, completed_at, note_id))
+        WHERE note_id = ? AND status = 'running'
+    """, (completed_at, completed_at, note_id))
     conn.commit()
+
+    if finished.rowcount == 0:
+        # The user cancelled while the event was being created. The local row
+        # is already 'cancelled', but Google now holds an event nobody wants,
+        # and the undo could not have queued it because the id did not exist
+        # yet. Queue it here instead.
+        enqueue_remote_delete(conn, "calendar", note_id, calendar_event_id)
+        conn.commit()
+        drain_remote_deletes(conn, "calendar", delete_calendar_event)
+        return
+
+    finish_source_note(conn, note_id, keep_factory, tasks_factory)
 
 
 def main():
@@ -354,6 +373,8 @@ def main():
     try:
         ensure_schema(conn)
         requeue_stale_running_jobs(conn, "calendar_jobs")
+        # Retry anything a previous cancellation could not remove.
+        drain_remote_deletes(conn, "calendar", delete_calendar_event)
         jobs = conn.execute("""
             SELECT note_id, event_title, event_start, event_end, all_day,
                    event_location, event_description

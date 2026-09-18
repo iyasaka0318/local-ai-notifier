@@ -23,8 +23,12 @@ const ALLOWED_POLL_INTERVALS = [1, 5, 10, 15, 30];
 const TASKS_SIGNAL_ATTEMPT_PROPERTY = 'TASKS_SIGNAL_LAST_ATTEMPT';
 const TASKS_SIGNAL_ATTEMPT_COOLDOWN_MS = 90 * 1000;
 const TASKS_TRIGGER_INSTALL_STAGGER_MS = 15 * 1000;
-const INGEST_REQUEST_PROPERTY_PREFIX = 'INGEST_';
-const INGEST_DEDUPE_MS = 10 * 60 * 1000;
+// 1リクエスト1プロパティだと件数が際限なく増え、Propertiesの500KB上限に
+// 当たった時点で「登録後の記録」が失敗して二重登録を招きます。
+// 台帳を1プロパティにまとめ、件数と期限の両方で上限を掛けます。
+const INGEST_LEDGER_PROPERTY = 'INGEST_LEDGER';
+const INGEST_DEDUPE_MS = 24 * 60 * 60 * 1000;
+const INGEST_LEDGER_MAX_ENTRIES = 200;
 const INGEST_TITLE_MAX = 40;
 const AI_TASK_LIST_ID_PROPERTY = 'AI_TASK_LIST_ID';
 
@@ -173,39 +177,66 @@ function doPost(e) {
         return jsonResponse_({ok: false, error: '本文がありません'});
       }
 
+      // The dedupe check, the insert and the record have to be one unit.
+      // Without the lock two retries both read "no record", both insert, and
+      // both answer duplicate=false - which is exactly what a phone does when
+      // the first response is slow.
+      lock = LockService.getScriptLock();
+      if (!lock.tryLock(45000)) {
+        return jsonResponse_({ok: false, error: '取り込みが混み合っています'});
+      }
+
       const properties = PropertiesService.getScriptProperties();
       const requestId = String(request.request_id || '').trim();
-      let dedupeKey = null;
+      const ledger = readIngestLedger_(properties);
+
       if (requestId) {
-        // A retry from a flaky phone connection must not create a second task.
-        dedupeKey = INGEST_REQUEST_PROPERTY_PREFIX + sha256Hex_(requestId);
-        const previous = properties.getProperty(dedupeKey);
-        if (previous) {
-          const record = JSON.parse(previous);
-          if (Date.now() - record.at < INGEST_DEDUPE_MS) {
+        const previous = ledger.entries[requestId];
+        if (previous && previous.task_id) {
+          return jsonResponse_({
+            ok: true,
+            task_id: previous.task_id,
+            task_list_id: previous.list_id || null,
+            duplicate: true,
+          });
+        }
+        if (previous && !previous.task_id) {
+          // A previous attempt inserted but died before recording the id.
+          // Adopt the matching task instead of creating a second one.
+          const adopted = findRecentTaskByContent_(
+            previous.list_id || aiInboxListId_(properties), rawText
+          );
+          if (adopted) {
+            ledger.entries[requestId] = {
+              task_id: adopted, list_id: previous.list_id, at: Date.now(),
+            };
+            writeIngestLedger_(properties, ledger);
             return jsonResponse_({
-              ok: true,
-              task_id: record.task_id,
-              duplicate: true,
+              ok: true, task_id: adopted, duplicate: true, recovered: true,
             });
           }
         }
       }
 
       const taskListId = aiInboxListId_(properties);
+      if (requestId) {
+        // Reserve before inserting, so a crash between insert and record is
+        // recoverable rather than invisible.
+        ledger.entries[requestId] = {task_id: null, list_id: taskListId, at: Date.now()};
+        writeIngestLedger_(properties, ledger);
+      }
+
       const title = String(request.title || '').trim()
         || rawText.slice(0, INGEST_TITLE_MAX);
       const created = Tasks.Tasks.insert({title: title, notes: rawText}, taskListId);
 
-      if (dedupeKey) {
-        properties.setProperty(
-          dedupeKey,
-          JSON.stringify({task_id: created.id, at: Date.now()})
-        );
+      if (requestId) {
+        ledger.entries[requestId] = {
+          task_id: created.id, list_id: taskListId, at: Date.now(),
+        };
+        writeIngestLedger_(properties, ledger);
       }
 
-      // Signal immediately instead of waiting for the next poll. The task is
-      // already stored, so a signal failure only costs latency, never data.
       // 既定では合図を送りません。Google の送信元から ntfy への接続は
       // 断続的に数十秒ハングし、その待ち時間が呼び出し側のタイムアウトに
       // なります。合図はスマホ／PC から直接送るほうが速く確実です。
@@ -262,15 +293,31 @@ function doPost(e) {
     const properties = PropertiesService.getScriptProperties();
     const jobKey = 'event_' + sha256Hex_(noteId);
     const existingEventId = properties.getProperty(jobKey);
+    const calendar = CalendarApp.getDefaultCalendar();
+
+    // An existing key means either a retry of the same request or a
+    // correction. Returning the stored id for both is what let
+    // "さっきの予定を10時に" succeed locally while Google kept the old time.
     if (existingEventId) {
-      return jsonResponse_({
-        ok: true,
-        event_id: existingEventId,
-        duplicate: true,
-      });
+      let existing = null;
+      try {
+        existing = calendar.getEventById(existingEventId);
+      } catch (lookupError) {
+        existing = null;
+      }
+      if (existing) {
+        const changed = applyEventFields_(existing, request, title);
+        return jsonResponse_({
+          ok: true,
+          event_id: existingEventId,
+          duplicate: !changed,
+          updated: changed,
+        });
+      }
+      // Removed by hand on the Google side. Fall through and create it again.
+      properties.deleteProperty(jobKey);
     }
 
-    const calendar = CalendarApp.getDefaultCalendar();
     const options = {};
     if (request.location) options.location = String(request.location);
     if (request.description) options.description = String(request.description);
@@ -311,6 +358,126 @@ function doPost(e) {
   } finally {
     if (lock && lock.hasLock()) lock.releaseLock();
   }
+}
+
+/** 取り込み済みリクエストの台帳を読み、期限切れを落とします。 */
+function readIngestLedger_(properties) {
+  let ledger = {entries: {}};
+  try {
+    const raw = properties.getProperty(INGEST_LEDGER_PROPERTY);
+    if (raw) ledger = JSON.parse(raw);
+  } catch (parseError) {
+    ledger = {entries: {}};
+  }
+  if (!ledger.entries) ledger.entries = {};
+
+  const cutoff = Date.now() - INGEST_DEDUPE_MS;
+  Object.keys(ledger.entries).forEach(function(key) {
+    const entry = ledger.entries[key];
+    if (!entry || !entry.at || entry.at < cutoff) delete ledger.entries[key];
+  });
+  return ledger;
+}
+
+/** 台帳を保存します。件数が上限を超えたら古い順に落とします。 */
+function writeIngestLedger_(properties, ledger) {
+  const keys = Object.keys(ledger.entries);
+  if (keys.length > INGEST_LEDGER_MAX_ENTRIES) {
+    keys.sort(function(a, b) {
+      return (ledger.entries[a].at || 0) - (ledger.entries[b].at || 0);
+    });
+    keys.slice(0, keys.length - INGEST_LEDGER_MAX_ENTRIES).forEach(function(key) {
+      delete ledger.entries[key];
+    });
+  }
+  properties.setProperty(INGEST_LEDGER_PROPERTY, JSON.stringify(ledger));
+}
+
+/**
+ * 予約済みだがIDを記録できなかったリクエストの実体を探します。
+ * 挿入後・記録前にスクリプトが落ちた場合の回収経路です。
+ */
+function findRecentTaskByContent_(taskListId, rawText) {
+  if (!taskListId) return null;
+  const cutoff = new Date(Date.now() - INGEST_DEDUPE_MS).toISOString();
+  let pageToken = null;
+  do {
+    const response = Tasks.Tasks.list(taskListId, {
+      maxResults: 100,
+      showCompleted: false,
+      updatedMin: cutoff,
+      pageToken: pageToken,
+    });
+    const items = response.items || [];
+    for (let i = 0; i < items.length; i++) {
+      if (String(items[i].notes || '') === rawText) return items[i].id;
+    }
+    pageToken = response.nextPageToken || null;
+  } while (pageToken);
+  return null;
+}
+
+/**
+ * 既存イベントを要求どおりの内容へ揃えます。
+ * 実際に変更した場合だけ true を返すので、呼び出し側は
+ * 「再送による重複」と「訂正による更新」を区別できます。
+ */
+function applyEventFields_(event, request, title) {
+  let changed = false;
+
+  if (event.getTitle() !== title) {
+    event.setTitle(title);
+    changed = true;
+  }
+
+  if (request.all_day) {
+    const start = parseDateOnly_(request.event_start);
+    const end = request.event_end
+      ? parseDateOnly_(request.event_end)
+      : addDays_(start, 1);
+    if (end.getTime() <= start.getTime()) {
+      throw new Error('終了日は開始日より後である必要があります');
+    }
+    if (
+      !event.isAllDayEvent()
+      || event.getAllDayStartDate().getTime() !== start.getTime()
+      || event.getAllDayEndDate().getTime() !== end.getTime()
+    ) {
+      event.setAllDayDates(start, end);
+      changed = true;
+    }
+  } else {
+    const start = new Date(request.event_start);
+    const end = request.event_end
+      ? new Date(request.event_end)
+      : new Date(start.getTime() + 60 * 60 * 1000);
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      throw new Error('予定日時を解釈できません');
+    }
+    if (end.getTime() <= start.getTime()) {
+      throw new Error('終了時刻は開始時刻より後である必要があります');
+    }
+    if (
+      event.isAllDayEvent()
+      || event.getStartTime().getTime() !== start.getTime()
+      || event.getEndTime().getTime() !== end.getTime()
+    ) {
+      event.setTime(start, end);
+      changed = true;
+    }
+  }
+
+  const location = request.location ? String(request.location) : '';
+  if (event.getLocation() !== location) {
+    event.setLocation(location);
+    changed = true;
+  }
+  const description = request.description ? String(request.description) : '';
+  if (event.getDescription() !== description) {
+    event.setDescription(description);
+    changed = true;
+  }
+  return changed;
 }
 
 // エディタ上で一度実行し、カレンダー権限を許可してください。

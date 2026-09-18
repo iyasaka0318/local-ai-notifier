@@ -32,7 +32,11 @@ from persistent_reminders import (
 )
 from report_notifier import send_execution_report
 from project_paths import DB_PATH, RUNTIME_DIR, ensure_runtime_directories
-from reminder_worker import dispatch_persistent_now, send_notification
+from reminder_worker import (
+    dispatch_persistent_now,
+    parse_scheduled_at,
+    send_notification,
+)
 from failure_notifier import notify_processing_failure
 from state_store import (
     cancel_reminders,
@@ -878,12 +882,27 @@ def apply_correction(conn, item, pending_calendar_deletes=None, now=None):
                                                  'notified', 'sending')
             """, (scheduled_at, now, item_id))
         elif kind == "calendar":
+            # Moving the start while leaving the end behind can invert the
+            # event. Shift the end by the same amount so the duration the user
+            # originally gave survives the correction.
+            row = conn.execute(
+                "SELECT event_start, event_end FROM calendar_jobs WHERE note_id = ?",
+                (item_id,),
+            ).fetchone()
+            new_end = None
+            if row and row[0] and row[1]:
+                try:
+                    delta = parse_scheduled_at(scheduled_at) - parse_scheduled_at(row[0])
+                    new_end = (parse_scheduled_at(row[1]) + delta).isoformat()
+                except (TypeError, ValueError):
+                    new_end = None
             cursor = conn.execute("""
                 UPDATE calendar_jobs
-                SET event_start = ?, status = 'pending', calendar_event_id = NULL,
+                SET event_start = ?, event_end = ?, status = 'pending',
+                    calendar_event_id = calendar_event_id,
                     last_error = NULL, updated_at = ?
                 WHERE note_id = ? AND status != 'cancelled'
-            """, (scheduled_at, now, item_id))
+            """, (scheduled_at, new_end, now, item_id))
         else:
             raise ValueError("この操作は日時を変更できません")
         # Reporting success for an UPDATE that matched nothing would tell the
@@ -1238,10 +1257,8 @@ def process_note(conn, cur, keep, note, inbox_source):
     for error in run_pending_calendar_deletes(
         pending_calendar_deletes, delete_calendar_event
     ):
-        print("カレンダーからの削除に失敗:", error)
-        notify_processing_failure(
-            conn, NTFY_TOPIC, "カレンダー予定の取り消し", note.id, error, retrying=False,
-        )
+        # The deletion stays queued, so this is a delay, not a loss.
+        print("カレンダーからの削除に失敗（キューに残ります）:", error)
 
     for item, item_id in zip(items, item_ids):
         try:
