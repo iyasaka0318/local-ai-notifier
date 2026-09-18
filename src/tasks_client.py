@@ -7,6 +7,10 @@ from urllib.parse import quote, unquote
 import requests
 from project_paths import CONFIG_DIR
 
+class RetryableWebhookError(RuntimeError):
+    """The request did not land, but sending it again is safe."""
+
+
 TASK_ID_PREFIX = "tasks:"
 INGEST_TIMEOUT_SECONDS = 60
 SIGNAL_TIMEOUT_SECONDS = 15
@@ -110,11 +114,23 @@ class TasksInboxClient:
             if attempt < 2:
                 time.sleep(attempt + 1)
         response.raise_for_status()
+
+        content_type = (response.headers.get("content-type") or "").lower()
+        if "json" not in content_type:
+            # Apps Script answers an internal failure or a frontend cutoff with
+            # an HTML error page under HTTP 200. Reporting the decode error
+            # hides that, so name what actually came back.
+            raise RuntimeError(
+                "Apps Scriptがエラーページを返しました"
+                f"（content-type: {content_type or '不明'}）。"
+                "実行時間の超過かロック競合の可能性があります"
+            )
         result = response.json()
         if not result.get("ok"):
-            raise RuntimeError(
-                f"Google Tasks操作に失敗しました: {result.get('error', '不明なエラー')}"
-            )
+            error = result.get("error", "不明なエラー")
+            if result.get("retryable"):
+                raise RetryableWebhookError(f"一時的な失敗です: {error}")
+            raise RuntimeError(f"Google Tasks操作に失敗しました: {error}")
         return result
 
     def all(self):

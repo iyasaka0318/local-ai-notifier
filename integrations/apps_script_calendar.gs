@@ -29,8 +29,11 @@ const TASKS_TRIGGER_INSTALL_STAGGER_MS = 15 * 1000;
 const INGEST_LEDGER_PROPERTY = 'INGEST_LEDGER';
 const INGEST_DEDUPE_MS = 24 * 60 * 60 * 1000;
 const INGEST_LEDGER_MAX_ENTRIES = 200;
+const INGEST_LOCK_WAIT_MS = 8 * 1000;
 const INGEST_TITLE_MAX = 40;
 const AI_TASK_LIST_ID_PROPERTY = 'AI_TASK_LIST_ID';
+const TASK_LISTS_CACHE_PROPERTY = 'TASK_LISTS_CACHE';
+const TASK_LISTS_CACHE_MS = 30 * 60 * 1000;
 
 function doPost(e) {
   let lock = null;
@@ -181,9 +184,17 @@ function doPost(e) {
       // Without the lock two retries both read "no record", both insert, and
       // both answer duplicate=false - which is exactly what a phone does when
       // the first response is slow.
+      // Well under Google's frontend cutoff. Waiting longer does not produce a
+      // JSON answer, it produces an HTML error page, which the caller cannot
+      // tell apart from a protocol change. Failing fast lets the client retry
+      // with the same request_id, which the ledger makes safe.
       lock = LockService.getScriptLock();
-      if (!lock.tryLock(45000)) {
-        return jsonResponse_({ok: false, error: '取り込みが混み合っています'});
+      if (!lock.tryLock(INGEST_LOCK_WAIT_MS)) {
+        return jsonResponse_({
+          ok: false,
+          error: '取り込みが混み合っています。同じrequest_idで再送してください',
+          retryable: true,
+        });
       }
 
       const properties = PropertiesService.getScriptProperties();
@@ -286,8 +297,14 @@ function doPost(e) {
     }
 
     lock = LockService.getScriptLock();
-    if (!lock.tryLock(30000)) {
-      throw new Error('別の予定を処理中です。後でもう一度実行してください');
+    if (!lock.tryLock(INGEST_LOCK_WAIT_MS)) {
+      // Same reason as the ingest branch: a long wait returns HTML, not JSON.
+      // The worker keeps the job queued and will come back to it.
+      return jsonResponse_({
+        ok: false,
+        error: '別の処理と競合しました。後で再試行されます',
+        retryable: true,
+      });
     }
 
     const properties = PropertiesService.getScriptProperties();
@@ -502,23 +519,31 @@ function pollTasksAndSignal() {
   const properties = PropertiesService.getScriptProperties();
   if (!properties.getProperty(TASKS_SIGNAL_URL_PROPERTY)) return;
 
+  // The lock covers only the claim. Holding it across the listing and the
+  // ntfy fetch made every poll block the web app on the same script lock, so
+  // an ingest arriving mid-poll waited past Google's frontend timeout and the
+  // caller got an HTML error page with HTTP 200 instead of JSON.
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(100)) return;
-  let didPoll = false;
+  let claimed = false;
   try {
     const now = Date.now();
     const lastPoll = Number(
       properties.getProperty(TASKS_LAST_POLL_PROPERTY) || '0'
     );
-    if (now - lastPoll < TASKS_POLL_COOLDOWN_MS) return;
-    properties.setProperty(TASKS_LAST_POLL_PROPERTY, String(now));
-    didPoll = true;
+    if (now - lastPoll >= TASKS_POLL_COOLDOWN_MS) {
+      properties.setProperty(TASKS_LAST_POLL_PROPERTY, String(now));
+      claimed = true;
+    }
+  } finally {
+    lock.releaseLock();
+  }
+  if (!claimed) return;
+
+  try {
     pollTasksAndSignalUnlocked_();
   } finally {
-    if (didPoll) {
-      recordTasksPollStats_(properties, Date.now() - startedAt);
-    }
-    lock.releaseLock();
+    recordTasksPollStats_(properties, Date.now() - startedAt);
   }
 }
 
@@ -710,6 +735,20 @@ function listPendingAiTasks_(taskListId) {
 }
 
 function listTaskLists_() {
+  // Task lists change rarely, and the poll runs on a timer, so re-enumerating
+  // them every time is pure daily-quota spend.
+  const properties = PropertiesService.getScriptProperties();
+  try {
+    const cached = JSON.parse(
+      properties.getProperty(TASK_LISTS_CACHE_PROPERTY) || 'null'
+    );
+    if (cached && Date.now() - cached.at < TASK_LISTS_CACHE_MS && cached.items) {
+      return cached.items;
+    }
+  } catch (parseError) {
+    // Fall through and refresh.
+  }
+
   let pageToken = null;
   const taskLists = [];
   do {
@@ -720,6 +759,16 @@ function listTaskLists_() {
     Array.prototype.push.apply(taskLists, response.items || []);
     pageToken = response.nextPageToken || null;
   } while (pageToken);
+
+  properties.setProperty(
+    TASK_LISTS_CACHE_PROPERTY,
+    JSON.stringify({
+      at: Date.now(),
+      items: taskLists.map(function(list) {
+        return {id: list.id, title: list.title};
+      }),
+    })
+  );
   return taskLists;
 }
 

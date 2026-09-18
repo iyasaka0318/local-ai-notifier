@@ -6,9 +6,10 @@ from tasks_client import TasksInboxClient
 
 
 class Response:
-    def __init__(self, payload, status_code=200):
+    def __init__(self, payload, status_code=200, content_type="application/json"):
         self.payload = payload
         self.status_code = status_code
+        self.headers = {"content-type": content_type}
 
     def raise_for_status(self):
         return None
@@ -173,3 +174,40 @@ class IngestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AppsScriptErrorPageTests(unittest.TestCase):
+    """Apps Script answers a frontend cutoff with HTML under HTTP 200."""
+
+    def client(self, session):
+        return TasksInboxClient(
+            credentials={"endpoint_url": "https://example.test", "secret": "s"},
+            session=session,
+        )
+
+    def test_an_html_body_is_named_rather_than_decoded(self):
+        class HtmlSession:
+            def post(self, url, json=None, data=None, headers=None, timeout=None):
+                return Response("<html>...</html>", content_type="text/html")
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.client(HtmlSession()).ingest_text("メモ")
+        self.assertIn("エラーページ", str(caught.exception))
+
+    def test_a_retryable_failure_has_its_own_type(self):
+        class BusySession:
+            def post(self, url, json=None, data=None, headers=None, timeout=None):
+                return Response({"ok": False, "error": "混み合っています",
+                                 "retryable": True})
+
+        with self.assertRaises(tasks_client.RetryableWebhookError):
+            self.client(BusySession()).ingest_text("メモ")
+
+    def test_a_permanent_failure_stays_a_plain_error(self):
+        class DeniedSession:
+            def post(self, url, json=None, data=None, headers=None, timeout=None):
+                return Response({"ok": False, "error": "認証に失敗しました"})
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.client(DeniedSession()).ingest_text("メモ")
+        self.assertNotIsInstance(caught.exception, tasks_client.RetryableWebhookError)
