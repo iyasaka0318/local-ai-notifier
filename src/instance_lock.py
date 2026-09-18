@@ -1,10 +1,13 @@
 import os
 
-import msvcrt
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 class SingleInstanceLock:
-    """Small Windows process lock; the OS releases it if the process crashes."""
+    """Cross-platform process lock released automatically when the process exits."""
 
     def __init__(self, path):
         self.path = path
@@ -14,11 +17,17 @@ class SingleInstanceLock:
     def acquire(self):
         try:
             self._file = open(self.path, "a+b")
-            if os.fstat(self._file.fileno()).st_size == 0:
-                self._file.write(b"0")
-                self._file.flush()
-            self._file.seek(0)
-            msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+            if os.name == "nt":
+                if os.fstat(self._file.fileno()).st_size == 0:
+                    self._file.write(b"0")
+                    self._file.flush()
+                self._file.seek(0)
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(
+                    self._file.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
             self._locked = True
         except OSError:
             if self._file is not None:
@@ -38,8 +47,11 @@ class SingleInstanceLock:
             return
         try:
             if self._locked:
-                self._file.seek(0)
-                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+                if os.name == "nt":
+                    self._file.seek(0)
+                    msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
         finally:
             self._file.close()
             self._file = None
