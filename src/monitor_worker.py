@@ -10,7 +10,7 @@ from datetime import datetime
 from failure_notifier import notify_processing_failure
 from automation_config import OLLAMA_THINK
 from instance_lock import SingleInstanceLock
-from state_store import ensure_schema
+from state_store import ensure_schema, requeue_stale_found_monitors
 from project_paths import DB_PATH, RUNTIME_DIR, ensure_runtime_directories
 
 
@@ -412,6 +412,9 @@ conn = sqlite3.connect(
     timeout=30,
 )
 ensure_schema(conn)
+# A crash between claiming 'found' and delivering the alert would otherwise
+# swallow the discovery, so re-arm anything that never reached the phone.
+requeue_stale_found_monitors(conn)
 
 cur = conn.cursor()
 
@@ -768,6 +771,12 @@ for (
             # jobはactiveのまま
             continue
 
+
+        cur.execute(
+            "UPDATE web_monitors SET notified_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), job_id),
+        )
+        conn.commit()
 
         print(
             "監視ジョブを完了しました"

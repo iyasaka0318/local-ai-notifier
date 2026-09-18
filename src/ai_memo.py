@@ -229,8 +229,13 @@ def trash_processed_ai_memo(keep, note):
 
 
 def is_ready_to_trash(result):
-    """Return true only when no unresolved action would be hidden by trashing."""
-    if result.get("intent") == "unknown" or result.get("needs_confirmation"):
+    """Return true unless trashing would hide work that cannot run.
+
+    needs_confirmation deliberately does not block here. Holding the note back
+    would turn a confident guess into a chore for the user, and every ambiguous
+    classification is already rerouted to a runnable intent before this point.
+    """
+    if result.get("intent") in (None, "", "unknown"):
         return False
     if result.get("intent") == "reminder":
         scheduled_at = result.get("scheduled_at")

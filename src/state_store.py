@@ -9,6 +9,18 @@ VALID_PROCESSING_STATUSES = {
 }
 RECOVERABLE_JOB_TABLES = {"research_jobs", "calendar_jobs", "wake_jobs"}
 
+# Work tables keyed by item id rather than by source note id.
+ITEM_TABLES = (
+    "todos",
+    "memos",
+    "calendar_jobs",
+    "reminders",
+    "wake_jobs",
+    "web_monitors",
+)
+
+ITEM_ID_SEPARATOR = "#"
+
 
 def utc_now():
     return datetime.now().astimezone().isoformat()
@@ -277,6 +289,46 @@ def ensure_schema(conn):
     """)
     _add_column(conn, "failure_notifications", "last_attempted_at TEXT")
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS action_log (
+            token TEXT PRIMARY KEY,
+            source_note_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            detail TEXT,
+            fallback_reason TEXT,
+            created_at TEXT NOT NULL,
+            undone_at TEXT,
+            undo_error TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_action_log_created
+        ON action_log (created_at DESC)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_action_log_item
+        ON action_log (item_id)
+    """)
+
+    # One Keep/Tasks note can now produce several work items, so every work row
+    # remembers which note it came from. Existing rows are one-to-one, so the
+    # backfill is simply the old note_id.
+    for table_name in ITEM_TABLES:
+        _add_column(conn, table_name, "source_note_id TEXT")
+        conn.execute(
+            f"UPDATE {table_name} SET source_note_id = note_id "
+            f"WHERE source_note_id IS NULL"
+        )
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table_name}_source "
+            f"ON {table_name} (source_note_id)"
+        )
+
+    _add_column(conn, "persistent_reminders", "group_name TEXT")
+    _add_column(conn, "web_monitors", "notified_at TEXT")
+
     now = utc_now()
     conn.execute("""
         UPDATE processed_notes
@@ -448,9 +500,27 @@ def mark_note_failed(conn, note_id, content_hash, error, updated_at=None):
     conn.commit()
 
 
-def save_structured_item(cursor, note_id, title, text, result, now=None):
-    """Upsert the current memo/todo/calendar projection for a Keep note."""
+INTENT_TABLES = {
+    "todo": "todos",
+    "calendar": "calendar_jobs",
+    "memo": "memos",
+    "reminder": "reminders",
+}
+
+
+def _stamp_source_note(cursor, table_name, item_id, source_note_id):
+    cursor.execute(
+        f"UPDATE {table_name} SET source_note_id = ? WHERE note_id = ?",
+        (source_note_id, item_id),
+    )
+
+
+def save_structured_item(
+    cursor, note_id, title, text, result, now=None, source_note_id=None
+):
+    """Upsert the current memo/todo/calendar projection for one work item."""
     now = now or utc_now()
+    source_note_id = source_note_id or note_id
     intent = result["intent"]
     summary = result["summary"]
 
@@ -623,6 +693,11 @@ def save_structured_item(cursor, note_id, title, text, result, now=None):
         ))
 
 
+    table_name = INTENT_TABLES.get(intent)
+    if table_name:
+        _stamp_source_note(cursor, table_name, note_id, source_note_id)
+
+
 def is_generated_note(cursor, note_id):
     return cursor.execute(
         "SELECT 1 FROM generated_notes WHERE note_id = ?",
@@ -630,8 +705,9 @@ def is_generated_note(cursor, note_id):
     ).fetchone() is not None
 
 
-def upsert_wake_job(cursor, note_id, now=None):
+def upsert_wake_job(cursor, note_id, now=None, source_note_id=None):
     now = now or utc_now()
+    source_note_id = source_note_id or source_note_id_of(note_id)
     cursor.execute("""
         INSERT INTO wake_jobs (note_id, status, created_at, updated_at)
         VALUES (?, 'pending', ?, ?)
@@ -643,6 +719,7 @@ def upsert_wake_job(cursor, note_id, now=None):
             last_error = NULL,
             updated_at = excluded.updated_at
     """, (note_id, now, now))
+    _stamp_source_note(cursor, "wake_jobs", note_id, source_note_id)
 
 
 def upsert_research_job(cursor, source_note_id, plan, now=None):
@@ -706,9 +783,10 @@ def upsert_research_job(cursor, source_note_id, plan, now=None):
     ).fetchone()[0]
 
 
-def upsert_web_monitor(cursor, note_id, summary, resolved, now=None):
+def upsert_web_monitor(cursor, note_id, summary, resolved, now=None, source_note_id=None):
     """Create a monitor or refresh its target after a Keep note edit."""
     now = now or utc_now()
+    source_note_id = source_note_id or source_note_id_of(note_id)
     status = "found" if resolved["target_found"] else "active"
     monitor_urls = json.dumps(resolved["monitor_urls"], ensure_ascii=False)
     existing = cursor.execute(
@@ -730,6 +808,7 @@ def upsert_web_monitor(cursor, note_id, summary, resolved, now=None):
             resolved["found_url"],
             existing[0],
         ))
+        _stamp_source_note(cursor, "web_monitors", note_id, source_note_id)
         return False
 
     cursor.execute("""
@@ -746,6 +825,7 @@ def upsert_web_monitor(cursor, note_id, summary, resolved, now=None):
         now,
         resolved["found_url"],
     ))
+    _stamp_source_note(cursor, "web_monitors", note_id, source_note_id)
     return True
 
 
@@ -852,3 +932,106 @@ def cancel_reminders(conn, target_note_ids):
         }
         for row in rows
     ]
+
+
+# =========================================================
+# Multi-item notes
+# =========================================================
+
+def item_id_for(source_note_id, index):
+    """Stable per-item key.
+
+    Index 0 keeps the bare note id so every row written before multi-item
+    support, and every downstream lookup that predates it, keeps working.
+    """
+    if index == 0:
+        return source_note_id
+    return f"{source_note_id}{ITEM_ID_SEPARATOR}{index}"
+
+
+def source_note_id_of(item_id):
+    return (item_id or "").split(ITEM_ID_SEPARATOR, 1)[0]
+
+
+def supersede_orphan_items(cursor, source_note_id, active_item_ids, now=None):
+    """Retire items that an edited note no longer produces."""
+    now = now or utc_now()
+    active = list(active_item_ids)
+    placeholders = ",".join("?" for _ in active) or "NULL"
+    for table_name in ("todos", "memos", "calendar_jobs", "wake_jobs"):
+        cursor.execute(
+            f"""
+            UPDATE {table_name} SET status = 'superseded', updated_at = ?
+            WHERE source_note_id = ? AND status != 'superseded'
+              AND note_id NOT IN ({placeholders})
+            """,
+            [now, source_note_id, *active],
+        )
+    cursor.execute(
+        f"""
+        UPDATE reminders SET status = 'superseded', updated_at = ?
+        WHERE source_note_id = ? AND status IN ('pending', 'waiting_information')
+          AND note_id NOT IN ({placeholders})
+        """,
+        [now, source_note_id, *active],
+    )
+    cursor.execute(
+        f"""
+        UPDATE web_monitors SET status = 'superseded'
+        WHERE source_note_id = ? AND status = 'active'
+          AND note_id NOT IN ({placeholders})
+        """,
+        [source_note_id, *active],
+    )
+
+
+# research_jobs and persistent_reminders key their UNIQUE column by item id, so
+# every table is matched by the same "item id belongs to this note" rule.
+OUTSTANDING_WORK_QUERIES = (
+    ("calendar_jobs", "note_id",
+     ("pending", "retry", "running", "waiting_auth", "waiting_information")),
+    ("wake_jobs", "note_id", ("pending", "retry", "running")),
+    ("research_jobs", "source_note_id", ("pending", "retry", "running")),
+)
+
+
+def source_note_has_outstanding_work(conn, source_note_id, exclude_item_id=None):
+    """True while any sibling item from the same note still needs a worker.
+
+    A note that produced three items must not complete its Google Task until
+    the last of them is done, otherwise the user sees the task disappear while
+    part of the request is still queued.
+    """
+    like_prefix = f"{source_note_id}{ITEM_ID_SEPARATOR}%"
+    for table_name, column, statuses in OUTSTANDING_WORK_QUERIES:
+        placeholders = ",".join("?" for _ in statuses)
+        sql = (
+            f"SELECT {column} FROM {table_name} "
+            f"WHERE ({column} = ? OR {column} LIKE ?) "
+            f"AND status IN ({placeholders})"
+        )
+        params = [source_note_id, like_prefix]
+        for (row_id,) in conn.execute(sql, [*params, *statuses]).fetchall():
+            if exclude_item_id is not None and row_id == exclude_item_id:
+                continue
+            return True
+    return False
+
+
+def requeue_stale_found_monitors(conn, now=None, stale_after=timedelta(minutes=10)):
+    """Re-arm monitors that were claimed as found but never delivered.
+
+    monitor_worker claims 'found' before notifying so a cancelled monitor never
+    produces a stale alert. That claim would otherwise swallow the discovery if
+    the process died before the notification went out.
+    """
+    now = now or datetime.now().astimezone()
+    cutoff = (now - stale_after).isoformat()
+    cursor = conn.execute("""
+        UPDATE web_monitors
+        SET status = 'active', found_url = NULL
+        WHERE status = 'found' AND notified_at IS NULL
+          AND (last_checked_at IS NULL OR last_checked_at < ?)
+    """, (cutoff,))
+    conn.commit()
+    return cursor.rowcount

@@ -6,18 +6,31 @@ import requests
 from ddgs import DDGS
 from datetime import datetime
 
+from action_log import (
+    get_action,
+    record_action,
+    recent_actions,
+    run_pending_calendar_deletes,
+    undo_action,
+)
 from ai_memo import is_ready_to_trash, parse_ai_memo, trash_processed_ai_memo
 from automation_config import OLLAMA_THINK, VAGUE_TIMES
+from calendar_worker import delete_calendar_event
 from classification_output import rewrite_classification_output
+from intent_fallback import apply_intent_fallback
 from instance_lock import SingleInstanceLock
 from inbox_client import get_inbox_client
 from output_policy import infer_research_notification_mode
 from persistent_reminders import (
     add_task as add_persistent_task,
+    complete_group,
     complete_task as complete_persistent_task,
     create_notify_now_command,
+    list_active_groups,
     list_active_tasks as list_active_persistent_tasks,
+    normalize_task_text,
 )
+from report_notifier import send_execution_report
 from project_paths import DB_PATH, RUNTIME_DIR, ensure_runtime_directories
 from reminder_worker import dispatch_persistent_now, send_notification
 from failure_notifier import notify_processing_failure
@@ -31,12 +44,15 @@ from state_store import (
     mark_note_waiting_downstream,
     note_content_hash,
     is_generated_note,
+    item_id_for,
     list_pending_reminders,
     list_active_web_monitors,
     save_structured_item,
+    supersede_orphan_items,
     upsert_wake_job,
     upsert_research_job,
     upsert_web_monitor,
+    utc_now,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -63,11 +79,6 @@ def mark_note_failed(conn, note_id, content_hash, error):
         retrying=True,
     )
 
-ensure_runtime_directories()
-instance_lock = SingleInstanceLock(str(RUNTIME_DIR / "keep_watcher.lock"))
-if not instance_lock.acquire():
-    print("Keep watcher is already running; this invocation will exit.")
-    raise SystemExit(0)
 
 
 # =========================================================
@@ -117,166 +128,150 @@ def ask_ollama(system_prompt, user_data, schema):
 # 1. Keepメモの意図分類
 # =========================================================
 
+
+ITEM_SCHEMA = {   'type': 'object',
+    'properties': {   'intent': {   'type': 'string',
+                                    'enum': [   'memo',
+                                                'todo',
+                                                'web_monitor',
+                                                'web_monitor_manage',
+                                                'reminder_manage',
+                                                'calendar',
+                                                'reminder',
+                                                'persistent_reminder',
+                                                'wake_briefing',
+                                                'research',
+                                                'unknown',
+                                                'correction']},
+                      'summary': {'type': 'string'},
+                      'notification_text': {'type': ['string', 'null']},
+                      'event_title': {'type': ['string', 'null']},
+                      'event_start': {'type': ['string', 'null']},
+                      'event_end': {'type': ['string', 'null']},
+                      'all_day': {'type': 'boolean'},
+                      'event_location': {'type': ['string', 'null']},
+                      'event_description': {'type': ['string', 'null']},
+                      'actionable': {'type': 'boolean'},
+                      'calendar_ready': {'type': 'boolean'},
+                      'needs_target_resolution': {'type': 'boolean'},
+                      'needs_confirmation': {'type': 'boolean'},
+                      'missing_information': {   'type': 'array',
+                                                 'items': {'type': 'string'}},
+                      'scheduled_at': {'type': ['string', 'null']},
+                      'recurrence': {'type': ['string', 'null']},
+                      'persistent_reminder_action': {   'type': ['string', 'null'],
+                                                        'enum': [   'add',
+                                                                    'complete',
+                                                                    'notify_now',
+                                                                    None]},
+                      'persistent_task_text': {'type': ['string', 'null']},
+                      'persistent_target_id': {'type': ['integer', 'null']},
+                      'web_monitor_action': {   'type': ['string', 'null'],
+                                                'enum': ['list', 'delete', None]},
+                      'web_monitor_target_ids': {   'type': 'array',
+                                                    'items': {'type': 'integer'}},
+                      'reminder_manage_action': {   'type': ['string', 'null'],
+                                                    'enum': ['list', 'cancel', None]},
+                      'reminder_target_ids': {   'type': 'array',
+                                                 'items': {'type': 'string'}},
+                      'actions': {   'type': 'array',
+                                     'items': {   'type': 'object',
+                                                  'properties': {   'type': {   'type': 'string',
+                                                                                'enum': [   'research',
+                                                                                            'save_memo',
+                                                                                            'notify']},
+                                                                    'objective': {   'type': [   'string',
+                                                                                                 'null']},
+                                                                    'requested_items': {   'type': 'array',
+                                                                                           'items': {   'type': 'string'}},
+                                                                    'when': {   'type': 'string',
+                                                                                'enum': [   'now',
+                                                                                            'after_previous',
+                                                                                            'at_time']},
+                                                                    'execute_at': {   'type': [   'string',
+                                                                                                  'null']},
+                                                                    'scheduled_at': {   'type': [   'string',
+                                                                                                    'null']},
+                                                                    'notification_mode': {   'type': [   'string',
+                                                                                                         'null'],
+                                                                                             'enum': [   'completion_only',
+                                                                                                         'result_summary',
+                                                                                                         'detailed_result',
+                                                                                                         None]}},
+                                                  'required': [   'type',
+                                                                  'objective',
+                                                                  'requested_items',
+                                                                  'when',
+                                                                  'execute_at',
+                                                                  'scheduled_at',
+                                                                  'notification_mode']}},
+                      'persistent_group': {'type': ['string', 'null']},
+                      'correction_target': {'type': ['string', 'null']},
+                      'correction_action': {   'type': ['string', 'null'],
+                                               'enum': [   'reschedule',
+                                                           'rewrite',
+                                                           'cancel',
+                                                           None]}},
+    'required': [   'intent',
+                    'summary',
+                    'notification_text',
+                    'event_title',
+                    'event_start',
+                    'event_end',
+                    'all_day',
+                    'event_location',
+                    'event_description',
+                    'actionable',
+                    'calendar_ready',
+                    'needs_target_resolution',
+                    'needs_confirmation',
+                    'missing_information',
+                    'scheduled_at',
+                    'recurrence',
+                    'persistent_reminder_action',
+                    'persistent_task_text',
+                    'persistent_target_id',
+                    'web_monitor_action',
+                    'web_monitor_target_ids',
+                    'reminder_manage_action',
+                    'reminder_target_ids',
+                    'actions',
+                    'persistent_group',
+                    'correction_target',
+                    'correction_action']}
+
+
 CLASSIFY_SCHEMA = {
     "type": "object",
     "properties": {
-        "intent": {
-            "type": "string",
-            "enum": [
-                "memo",
-                "todo",
-                "web_monitor",
-                "web_monitor_manage",
-                "reminder_manage",
-                "calendar",
-                "reminder",
-                "persistent_reminder",
-                "wake_briefing",
-                "research",
-                "unknown"
-            ]
-        },
-        "summary": {
-            "type": "string"
-        },
-        "notification_text": {
-            "type": ["string", "null"]
-        },
-        "event_title": {
-            "type": ["string", "null"]
-        },
-        "event_start": {
-            "type": ["string", "null"]
-        },
-        "event_end": {
-            "type": ["string", "null"]
-        },
-        "all_day": {
-            "type": "boolean"
-        },
-        "event_location": {
-            "type": ["string", "null"]
-        },
-        "event_description": {
-            "type": ["string", "null"]
-        },
-        "actionable": {
-            "type": "boolean"
-        },
-        "calendar_ready": {
-            "type": "boolean"
-        },
-        "needs_target_resolution": {
-            "type": "boolean"
-        },
-        "needs_confirmation": {
-            "type": "boolean"
-        },
-        "missing_information": {
-            "type": "array",
-            "items": {
-                "type": "string"
-            }
-        },
-        "scheduled_at": {
-            "type": ["string", "null"]
-        },
-        "recurrence": {
-            "type": ["string", "null"]
-        },
-        "persistent_reminder_action": {
-            "type": ["string", "null"],
-            "enum": ["add", "complete", "notify_now", None]
-        },
-        "persistent_task_text": {
-            "type": ["string", "null"]
-        },
-        "persistent_target_id": {
-            "type": ["integer", "null"]
-        },
-        "web_monitor_action": {
-            "type": ["string", "null"],
-            "enum": ["list", "delete", None]
-        },
-        "web_monitor_target_ids": {
-            "type": "array",
-            "items": {"type": "integer"}
-        },
-        "reminder_manage_action": {
-            "type": ["string", "null"],
-            "enum": ["list", "cancel", None]
-        },
-        "reminder_target_ids": {
-            "type": "array",
-            "items": {"type": "string"}
-        },
-        "actions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        "enum": ["research", "save_memo", "notify"]
-                    },
-                    "objective": {"type": ["string", "null"]},
-                    "requested_items": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    },
-                    "when": {
-                        "type": "string",
-                        "enum": ["now", "after_previous", "at_time"]
-                    },
-                    "execute_at": {"type": ["string", "null"]},
-                    "scheduled_at": {"type": ["string", "null"]},
-                    "notification_mode": {
-                        "type": ["string", "null"],
-                        "enum": [
-                            "completion_only", "result_summary",
-                            "detailed_result", None
-                        ]
-                    }
-                },
-                "required": [
-                    "type", "objective", "requested_items", "when",
-                    "execute_at", "scheduled_at", "notification_mode"
-                ]
-            }
-        }
+        "items": {"type": "array", "items": ITEM_SCHEMA, "minItems": 1}
     },
-    "required": [
-        "intent",
-        "summary",
-        "notification_text",
-        "event_title",
-        "event_start",
-        "event_end",
-        "all_day",
-        "event_location",
-        "event_description",
-        "actionable",
-        "calendar_ready",
-        "needs_target_resolution",
-        "needs_confirmation",
-        "missing_information",
-        "scheduled_at",
-        "recurrence",
-        "persistent_reminder_action",
-        "persistent_task_text",
-        "persistent_target_id",
-        "web_monitor_action",
-        "web_monitor_target_ids",
-        "reminder_manage_action",
-        "reminder_target_ids",
-        "actions"
-    ]
+    "required": ["items"],
 }
 
 
 CLASSIFY_PROMPT = """
-You classify Japanese requests for a personal local automation system.
-Return only the requested JSON schema.
+You classify Japanese speech-to-text requests for a personal local automation
+system. Return only the requested JSON schema.
+
+OUTPUT SHAPE
+Return {"items": [...]}. One spoken note often contains several unrelated
+requests, for example "明日9時に歯医者、あと牛乳買うのリマインドして、それと
+第74回の登録開始も見張っといて". Emit one item per distinct request, in the order
+they were spoken. Emit exactly one item when the note contains one request.
+Never merge two unrelated requests into one item and never drop one.
+
+NEVER ASK, ALWAYS DECIDE
+The user speaks into a phone and will not answer follow-up questions. Choosing
+the most reasonable interpretation is always better than refusing to decide.
+- Never use needs_confirmation to stall. Set it only as extra information.
+- Prefer a concrete intent over "unknown". Use "unknown" only when the text
+  carries no request at all.
+- If a date or time is partly unclear, still choose the most likely intent and
+  leave the unresolved field null. Downstream code reroutes the item to a form
+  that can run without that field, so a null is safe and a refusal is not.
+- Tolerate speech-recognition noise. Repair obvious mishearings from context
+  instead of treating them as unknown.
 
 Intents:
 - reminder: the user explicitly asks to be notified/reminded at a time.
@@ -298,7 +293,10 @@ Intents:
 - research: asks to investigate information now or at a specified future time and
   return a finite result. This is different from continuously watching for a change.
 - memo: information or an idea to retain, with no action request.
-- unknown: only when a safe classification is impossible.
+- correction: the user is fixing something they just said, such as
+  "さっきのリマインダー9時じゃなくて10時" or "今の予定やっぱりなし". Match the
+  request against recent_actions and put that entry's token in correction_target.
+- unknown: only when the text carries no request at all.
 
 Rules:
 - ユーザー向けの文章は必ず日本語で生成すること。
@@ -397,6 +395,26 @@ Rules:
   omission. Other actions use null.
 - actions must be [] for non-research intents.
 - summary and missing_information must be Japanese.
+- persistent_group groups saved tasks that belong to one running list, so they
+  arrive as a single notification instead of several. Use a short Japanese noun
+  such as "買い物" or "持ち物" when the task clearly belongs to such a list, for
+  example "牛乳買うのリマインドして" -> persistent_group "買い物". Use null when
+  the task does not belong to a recurring list. Existing groups are supplied in
+  active_persistent_groups; reuse an existing name instead of inventing a synonym.
+- When the user says a whole group is finished, for example "買い物終わった",
+  use persistent_reminder/complete with persistent_task_text set to the group
+  name and persistent_target_id null.
+- For correction, set correction_target to the token of the matching entry in
+  recent_actions and correction_action to one of:
+  reschedule (a new time; put it in scheduled_at),
+  rewrite (new wording; put it in summary and notification_text),
+  cancel (undo it entirely).
+  Match on meaning and recency together: "さっきの" means the newest entry that
+  fits the description. If nothing matches safely, set correction_target null and
+  classify the note as whatever it describes on its own.
+- For every intent other than correction, correction_target and correction_action
+  are null. For every intent other than persistent_reminder, persistent_group is
+  null.
 """
 
 
@@ -749,60 +767,359 @@ def resolve_web_monitor(request_text):
 
 
 # =========================================================
-# 3. Keep接続
+# 3. 分類結果の正規化
 # =========================================================
 
-print("Google Keep に接続中...")
+def normalize_items(result):
+    """Accept both the items envelope and a bare legacy classification."""
+    if isinstance(result, dict) and isinstance(result.get("items"), list):
+        items = [item for item in result["items"] if isinstance(item, dict)]
+    elif isinstance(result, dict):
+        items = [result]
+    else:
+        items = []
+    return [item for item in items if item.get("intent")]
 
-keep, inbox_source = get_inbox_client()
-print(f"AI Inbox source: {inbox_source}")
 
-print("Keep 接続OK")
+def classify_note(
+    text,
+    active_persistent_tasks=None,
+    active_web_monitors=None,
+    active_scheduled_reminders=None,
+    active_persistent_groups=None,
+    recent=None,
+):
+    result = ask_ollama(
+        CLASSIFY_PROMPT,
+        {
+            "current_datetime": datetime.now().astimezone().isoformat(),
+            "timezone": "Asia/Tokyo",
+            "vague_time_defaults": VAGUE_TIMES,
+            "active_persistent_tasks": [
+                {"id": task_id, "task_text": task_text}
+                for task_id, task_text in (active_persistent_tasks or [])
+            ],
+            "active_persistent_groups": active_persistent_groups or [],
+            "active_web_monitors": active_web_monitors or [],
+            "active_scheduled_reminders": active_scheduled_reminders or [],
+            "recent_actions": recent or [],
+            "text": text,
+        },
+        CLASSIFY_SCHEMA,
+    )
+    return ensure_classification_japanese(result)
+
+
+def format_detail(item):
+    """Short, scannable context for the execution report."""
+    intent = item.get("intent")
+    if intent == "reminder" and item.get("scheduled_at"):
+        return _format_reminder_time(item["scheduled_at"])
+    if intent == "calendar" and item.get("event_start"):
+        if item.get("all_day"):
+            return _format_reminder_time(item["event_start"]).split(" ")[0]
+        return _format_reminder_time(item["event_start"])
+    if intent == "persistent_reminder" and item.get("persistent_group"):
+        return item["persistent_group"]
+    return None
+
+
+def report_summary(item):
+    if item.get("intent") == "reminder":
+        return item.get("notification_text") or item.get("summary") or ""
+    if item.get("intent") == "calendar":
+        return item.get("event_title") or item.get("summary") or ""
+    if item.get("intent") == "persistent_reminder":
+        return item.get("persistent_task_text") or item.get("summary") or ""
+    return item.get("summary") or ""
 
 
 # =========================================================
-# 4. DB準備
+# 4. 訂正
 # =========================================================
 
-conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
-cur = conn.cursor()
-ensure_schema(conn)
+def apply_correction(conn, item, pending_calendar_deletes=None, now=None):
+    """Rewrite or undo something the user just registered.
+
+    Voice input is corrected immediately after it is spoken, so this path has to
+    work from a vague reference like "さっきの" rather than an exact identifier.
+    """
+    now = now or utc_now()
+    token = (item.get("correction_target") or "").strip()
+    action = item.get("correction_action")
+    if not token:
+        raise ValueError("訂正の対象を特定できませんでした")
+    target = get_action(conn, token)
+    if target is None:
+        raise ValueError("訂正の対象が見つかりませんでした")
+
+    if action == "cancel":
+        ok, message = undo_action(conn, token, pending_calendar_deletes)
+        if not ok:
+            raise ValueError(message)
+        return {"summary": message, "detail": None}
+
+    item_id = target["item_id"]
+    kind = target["kind"]
+
+    if action == "reschedule":
+        scheduled_at = item.get("scheduled_at")
+        if not scheduled_at:
+            raise ValueError("変更後の日時を読み取れませんでした")
+        if kind == "reminder":
+            conn.execute("""
+                UPDATE reminders
+                SET scheduled_at = ?, status = 'pending', notified_at = NULL,
+                    last_error = NULL, updated_at = ?
+                WHERE note_id = ? AND status IN ('pending', 'waiting_information',
+                                                 'notified', 'sending')
+            """, (scheduled_at, now, item_id))
+        elif kind == "calendar":
+            conn.execute("""
+                UPDATE calendar_jobs
+                SET event_start = ?, status = 'pending', calendar_event_id = NULL,
+                    last_error = NULL, updated_at = ?
+                WHERE note_id = ? AND status != 'cancelled'
+            """, (scheduled_at, now, item_id))
+        else:
+            raise ValueError("この操作は日時を変更できません")
+        return {
+            "summary": f"{target['summary']}",
+            "detail": _format_reminder_time(scheduled_at),
+        }
+
+    if action == "rewrite":
+        new_text = item.get("notification_text") or item.get("summary")
+        if not new_text:
+            raise ValueError("変更後の内容を読み取れませんでした")
+        if kind == "reminder":
+            conn.execute(
+                "UPDATE reminders SET summary = ?, updated_at = ? WHERE note_id = ?",
+                (new_text, now, item_id),
+            )
+        elif kind == "persistent_reminder":
+            conn.execute("""
+                UPDATE persistent_reminders
+                SET task_text = ?, normalized_text = ?, updated_at = ?
+                WHERE source_note_id = ? AND status = 'active'
+            """, (new_text, normalize_task_text(new_text), now, item_id))
+        elif kind == "todo":
+            conn.execute(
+                "UPDATE todos SET summary = ?, updated_at = ? WHERE note_id = ?",
+                (new_text, now, item_id),
+            )
+        elif kind == "memo":
+            conn.execute(
+                "UPDATE memos SET summary = ?, updated_at = ? WHERE note_id = ?",
+                (new_text, now, item_id),
+            )
+        elif kind == "calendar":
+            conn.execute(
+                "UPDATE calendar_jobs SET event_title = ?, summary = ?, "
+                "status = 'pending', updated_at = ? WHERE note_id = ?",
+                (new_text, new_text, now, item_id),
+            )
+        else:
+            raise ValueError("この操作は内容を変更できません")
+        return {"summary": new_text, "detail": None}
+
+    raise ValueError("訂正の種類を判定できませんでした")
 
 
 # =========================================================
-# 5. 新規Keepメモ処理
+# 5. 1アイテムの実行
 # =========================================================
 
-notes = keep.all()
+# Intents that publish their own notification, so the execution report skips them.
+SELF_REPORTING_INTENTS = {"web_monitor_manage", "reminder_manage"}
+# Intents whose real work happens in a later worker in the same cycle.
+DOWNSTREAM_INTENTS = {"wake_briefing", "research"}
 
-new_count = 0
+
+def process_item(conn, cur, item, item_id, source_note_id, ai_text, inbox_source,
+                 ai_memo_explicit, pending_calendar_deletes=None):
+    """Persist one work item. Returns (report_entry, needs_downstream)."""
+    item, fallback_reason = apply_intent_fallback(item)
+    intent = item["intent"]
+
+    if intent == "correction":
+        outcome = apply_correction(conn, item, pending_calendar_deletes)
+        return {
+            "kind": "correction",
+            "summary": outcome["summary"],
+            "detail": outcome["detail"],
+            "fallback_reason": None,
+            "token": None,
+        }, False
+
+    cur.execute("""
+    INSERT OR REPLACE INTO ai_results (
+        note_id, title, original_text, intent, summary, actionable,
+        calendar_ready, needs_target_resolution, needs_confirmation,
+        missing_information, processed_at, scheduled_at, automation_source,
+        recurrence, actions, notification_text, event_title, event_start,
+        event_end, all_day, event_location, event_description,
+        persistent_reminder_action, persistent_task_text, persistent_target_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        item_id,
+        item.get("title") or "",
+        ai_text,
+        intent,
+        item.get("summary") or "",
+        int(bool(item.get("actionable"))),
+        int(bool(item.get("calendar_ready"))),
+        int(bool(item.get("needs_target_resolution"))),
+        int(bool(item.get("needs_confirmation"))),
+        json.dumps(item.get("missing_information") or [], ensure_ascii=False),
+        datetime.now().isoformat(),
+        item.get("scheduled_at"),
+        (
+            "google_tasks"
+            if inbox_source == "google_tasks"
+            else ("explicit_ai_memo" if ai_memo_explicit else "inferred_automation")
+        ),
+        item.get("recurrence"),
+        json.dumps(item.get("actions") or [], ensure_ascii=False),
+        item.get("notification_text"),
+        item.get("event_title"),
+        item.get("event_start"),
+        item.get("event_end"),
+        int(bool(item.get("all_day"))),
+        item.get("event_location"),
+        item.get("event_description"),
+        item.get("persistent_reminder_action"),
+        item.get("persistent_task_text"),
+        item.get("persistent_target_id"),
+    ))
+
+    save_structured_item(
+        cur,
+        item_id,
+        item.get("title") or "",
+        ai_text,
+        {
+            "intent": intent,
+            "summary": item.get("summary") or "",
+            "actionable": bool(item.get("actionable")),
+            "calendar_ready": bool(item.get("calendar_ready")),
+            "needs_target_resolution": bool(item.get("needs_target_resolution")),
+            "needs_confirmation": bool(item.get("needs_confirmation")),
+            "missing_information": item.get("missing_information") or [],
+            "scheduled_at": item.get("scheduled_at"),
+            "recurrence": item.get("recurrence"),
+            "notification_text": item.get("notification_text"),
+            "event_title": item.get("event_title"),
+            "event_start": item.get("event_start"),
+            "event_end": item.get("event_end"),
+            "all_day": bool(item.get("all_day")),
+            "event_location": item.get("event_location"),
+            "event_description": item.get("event_description"),
+        },
+        source_note_id=source_note_id,
+    )
+
+    if intent == "persistent_reminder":
+        action = item.get("persistent_reminder_action")
+        if action == "add":
+            add_persistent_task(
+                conn,
+                item_id,
+                item.get("persistent_task_text"),
+                group_name=item.get("persistent_group"),
+            )
+        elif action == "complete":
+            cleared = complete_group(
+                conn, item.get("persistent_task_text"), command_note_id=item_id
+            )
+            if not cleared:
+                complete_persistent_task(
+                    conn,
+                    item_id,
+                    target_task_id=item.get("persistent_target_id"),
+                    task_text=item.get("persistent_task_text"),
+                )
+        elif action == "notify_now":
+            create_notify_now_command(conn, item_id)
+
+    elif intent == "web_monitor":
+        resolved = resolve_web_monitor(ai_text)
+        upsert_web_monitor(
+            cur,
+            item_id,
+            item.get("summary") or "",
+            resolved,
+            source_note_id=source_note_id,
+        )
+
+    elif intent == "wake_briefing":
+        upsert_wake_job(cur, item_id, source_note_id=source_note_id)
+
+    elif intent == "research":
+        upsert_research_job(cur, item_id, build_research_plan(item, ai_text))
+
+    if intent in SELF_REPORTING_INTENTS:
+        return None, False
+
+    token = record_action(
+        conn,
+        source_note_id=source_note_id,
+        item_id=item_id,
+        kind=intent,
+        summary=report_summary(item),
+        detail=format_detail(item),
+        fallback_reason=fallback_reason,
+    )
+    return {
+        "kind": intent,
+        "summary": report_summary(item),
+        "detail": format_detail(item),
+        "fallback_reason": fallback_reason,
+        "token": token,
+    }, intent in DOWNSTREAM_INTENTS or (
+        intent == "calendar" and bool(item.get("calendar_ready"))
+    )
 
 
-for note in notes:
-    if getattr(note, "trashed", False):
-        continue
+def run_side_effects(conn, item, item_id):
+    """Network work that must happen after the item's state is committed."""
+    intent = item.get("intent")
+    if intent == "web_monitor_manage":
+        execute_web_monitor_management(conn, item, NTFY_TOPIC)
+    elif intent == "reminder_manage":
+        execute_reminder_management(conn, item, NTFY_TOPIC)
+    elif (
+        intent == "persistent_reminder"
+        and item.get("persistent_reminder_action") == "notify_now"
+    ):
+        dispatch_persistent_now(conn, NTFY_TOPIC, item_id)
 
+
+# =========================================================
+# 6. 1メモの処理
+# =========================================================
+
+def process_note(conn, cur, keep, note, inbox_source):
+    """Returns True when the note produced work."""
     title = note.title or ""
     text = note.text or ""
     if (
         inbox_source == "google_keep"
         and (title.lstrip().startswith("[AI結果]") or is_generated_note(cur, note.id))
     ):
-        continue
-    content_hash = note_content_hash(title, text)
+        return False
 
+    content_hash = note_content_hash(title, text)
     if not claim_note(conn, note.id, content_hash):
-        continue
+        return False
 
     full_text = ""
-
     if title:
         full_text += f"タイトル: {title}\n"
-
     if text:
         full_text += f"本文: {text}"
-
     full_text = full_text.strip()
+
     ai_memo = parse_ai_memo(title, text)
     ai_text = ai_memo.text_for_ai if ai_memo.explicit else full_text
     trusted_inbox_item = ai_memo.explicit or (
@@ -812,300 +1129,156 @@ for note in notes:
     if inbox_source == "google_tasks" and not ai_memo.explicit:
         ai_text = (text or title).strip()
 
-
     if not full_text:
         mark_note_processed(conn, note.id, content_hash)
-        conn.commit()
-        continue
+        return False
 
     if not trusted_inbox_item:
         try:
             gate = should_process_unmarked(full_text)
-        except Exception as e:
-            mark_note_failed(conn, note.id, content_hash, e)
-            continue
-
+        except Exception as error:
+            mark_note_failed(conn, note.id, content_hash, error)
+            return False
         if not gate["should_process"]:
             mark_note_processed(conn, note.id, content_hash)
-            conn.commit()
-            continue
-
+            return False
 
     print()
     print("=" * 60)
-    print("新しいKeepメモ")
-    print("=" * 60)
     print(full_text)
-
     print("\nAIで意図判定中...")
 
-
     try:
-        result = classify_note(
+        classification = classify_note(
             ai_text,
             list_active_persistent_tasks(conn),
             list_active_web_monitors(conn),
             list_pending_reminders(conn),
+            list_active_groups(conn),
+            recent_actions(conn),
+        )
+    except Exception as error:
+        print("分類失敗:", error)
+        mark_note_failed(conn, note.id, content_hash, error)
+        return False
+
+    items = normalize_items(classification)
+    if not items:
+        # An empty classification is still a note the user spoke, so keep it
+        # rather than discarding it silently.
+        items = [{"intent": "unknown", "summary": ai_text[:200]}]
+
+    print("\n分類結果:", json.dumps(items, ensure_ascii=False, indent=2))
+
+    for item in items:
+        item.setdefault("title", title)
+
+    item_ids = [item_id_for(note.id, index) for index in range(len(items))]
+    entries = []
+    needs_downstream = False
+
+    # The classification projection is written as one unit so a failure halfway
+    # through a multi-item note cannot leave a partial interpretation behind.
+    pending_calendar_deletes = []
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        supersede_orphan_items(cur, note.id, item_ids)
+        for item, item_id in zip(items, item_ids):
+            entry, downstream = process_item(
+                conn, cur, item, item_id, note.id, ai_text, inbox_source,
+                ai_memo.explicit, pending_calendar_deletes,
+            )
+            if entry:
+                entries.append(entry)
+            needs_downstream = needs_downstream or downstream
+        conn.execute("COMMIT")
+    except Exception as error:
+        conn.execute("ROLLBACK")
+        print("処理失敗:", error)
+        mark_note_failed(conn, note.id, content_hash, error)
+        return False
+
+    # Side effects run after the commit: they send notifications and delete
+    # remote calendar events, and a delivery failure must not roll back state
+    # the user can already see.
+    for error in run_pending_calendar_deletes(
+        pending_calendar_deletes, delete_calendar_event
+    ):
+        print("カレンダーからの削除に失敗:", error)
+        notify_processing_failure(
+            conn, NTFY_TOPIC, "カレンダー予定の取り消し", note.id, error, retrying=False,
         )
 
-    except Exception as e:
-        print("分類失敗:")
-        print(e)
-        mark_note_failed(conn, note.id, content_hash, e)
-        continue
-
-
-    print("\n分類結果:")
-    print(
-        json.dumps(
-            result,
-            ensure_ascii=False,
-            indent=2
-        )
-    )
-
-
-    # =====================================================
-    # AI結果保存
-    # =====================================================
-
-    cur.execute("""
-    INSERT OR REPLACE INTO ai_results (
-        note_id,
-        title,
-        original_text,
-        intent,
-        summary,
-        actionable,
-        calendar_ready,
-        needs_target_resolution,
-        needs_confirmation,
-        missing_information,
-        processed_at,
-        scheduled_at,
-        automation_source,
-        recurrence,
-        actions,
-        notification_text,
-        event_title,
-        event_start,
-        event_end,
-        all_day,
-        event_location,
-        event_description,
-        persistent_reminder_action,
-        persistent_task_text,
-        persistent_target_id
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        note.id,
-        title,
-        text,
-        result["intent"],
-        result["summary"],
-        int(result["actionable"]),
-        int(result["calendar_ready"]),
-        int(result["needs_target_resolution"]),
-        int(result["needs_confirmation"]),
-        json.dumps(
-            result["missing_information"],
-            ensure_ascii=False
-        ),
-        datetime.now().isoformat(),
-        result["scheduled_at"],
-        (
-            "google_tasks"
-            if inbox_source == "google_tasks"
-            else ("explicit_ai_memo" if ai_memo.explicit else "inferred_automation")
-        ),
-        result["recurrence"],
-        json.dumps(result["actions"], ensure_ascii=False),
-        result["notification_text"],
-        result["event_title"],
-        result["event_start"],
-        result["event_end"],
-        int(result["all_day"]),
-        result["event_location"],
-        result["event_description"],
-        result["persistent_reminder_action"],
-        result["persistent_task_text"],
-        result["persistent_target_id"],
-    ))
-
-    save_structured_item(
-        cur,
-        note.id,
-        title,
-        text,
-        result,
-    )
-
-    if result["intent"] == "persistent_reminder":
+    for item, item_id in zip(items, item_ids):
         try:
-            action = result.get("persistent_reminder_action")
-            if action == "add":
-                add_persistent_task(
-                    conn,
-                    note.id,
-                    result.get("persistent_task_text"),
-                )
-            elif action == "complete":
-                complete_persistent_task(
-                    conn,
-                    note.id,
-                    target_task_id=result.get("persistent_target_id"),
-                    task_text=result.get("persistent_task_text"),
-                )
-            elif action == "notify_now":
-                create_notify_now_command(conn, note.id)
-                conn.commit()
-                dispatch_persistent_now(conn, NTFY_TOPIC, note.id)
-            else:
-                raise ValueError("継続リマインドの操作を判定できませんでした")
-        except Exception as e:
-            conn.rollback()
-            mark_note_failed(conn, note.id, content_hash, e)
-            continue
-
-    if result["intent"] == "web_monitor_manage":
-        try:
-            execute_web_monitor_management(
-                conn,
-                result,
-                NTFY_TOPIC,
+            run_side_effects(conn, item, item_id)
+        except Exception as error:
+            print("通知処理に失敗:", error)
+            notify_processing_failure(
+                conn, NTFY_TOPIC, "AIメモの実行", item_id, error, retrying=False,
             )
-        except Exception as e:
-            conn.rollback()
-            mark_note_failed(conn, note.id, content_hash, e)
-            continue
 
-    if result["intent"] == "reminder_manage":
+    if entries:
         try:
-            execute_reminder_management(
-                conn,
-                result,
-                NTFY_TOPIC,
+            send_execution_report(NTFY_TOPIC, entries)
+        except Exception as error:
+            print("実行報告の送信に失敗:", error)
+            notify_processing_failure(
+                conn, NTFY_TOPIC, "実行報告の通知", note.id, error, retrying=False,
             )
-        except Exception as e:
-            conn.rollback()
-            mark_note_failed(conn, note.id, content_hash, e)
-            continue
 
-    if result["intent"] == "wake_briefing":
-        upsert_wake_job(cur, note.id)
+    if needs_downstream:
         mark_note_waiting_downstream(conn, note.id, content_hash)
-        conn.commit()
-        new_count += 1
-        continue
+        return True
 
-    if result["intent"] == "research":
-        plan = build_research_plan(result, ai_text)
-        upsert_research_job(cur, note.id, plan)
-        mark_note_waiting_downstream(conn, note.id, content_hash)
-        conn.commit()
-        new_count += 1
-        continue
-
-    if result["intent"] == "calendar" and result["calendar_ready"]:
-        mark_note_waiting_downstream(conn, note.id, content_hash)
-        conn.commit()
-        new_count += 1
-        continue
-
-
-    # =====================================================
-    # web_monitorなら自動検索して監視登録
-    # =====================================================
-
-    if result["intent"] == "web_monitor":
-
-        print()
-        print("Web監視依頼を検出しました")
-        print("監視対象を自動検索します...")
-
-        try:
-            resolved = resolve_web_monitor(
-                ai_text
-            )
-
-            print()
-            print("監視対象判定:")
-            print(
-                json.dumps(
-                    resolved,
-                    ensure_ascii=False,
-                    indent=2
-                )
-            )
-
-            # 同じKeepメモから二重登録しない
-            upsert_web_monitor(
-                cur,
-                note.id,
-                result["summary"],
-                resolved,
-            )
-
-            if resolved:
-
-                print()
-                print("監視ジョブをDBに登録しました")
-
-                if resolved["target_found"]:
-                    print(
-                        "目的ページは既に存在します:"
-                    )
-                    print(resolved["found_url"])
-
-                else:
-                    print("監視URL:")
-
-                    for url in resolved["monitor_urls"]:
-                        print(" -", url)
-
-
-        except Exception as e:
-            print()
-            print("Web監視登録に失敗:")
-            print(e)
-
-            # web_monitor処理に失敗した場合、
-            # processed扱いにしない
-            conn.rollback()
-            mark_note_failed(conn, note.id, content_hash, e)
-            continue
-
-
-    # =====================================================
-    # 全処理成功 → 処理済みにする
-    # =====================================================
-
-    # Downstream state must be durable before an explicit AI memo is trashed.
-    conn.commit()
-
-    if trusted_inbox_item and is_ready_to_trash(result):
+    if trusted_inbox_item and all(is_ready_to_trash(item) for item in items):
         try:
             trash_processed_ai_memo(keep, note)
-        except Exception as e:
-            mark_note_failed(conn, note.id, content_hash, e)
-            continue
+        except Exception as error:
+            mark_note_failed(conn, note.id, content_hash, error)
+            return False
 
     mark_note_processed(conn, note.id, content_hash)
-    conn.commit()
-
-    new_count += 1
+    return True
 
 
-conn.close()
+# =========================================================
+# 7. エントリーポイント
+# =========================================================
+
+def main():
+    ensure_runtime_directories()
+    instance_lock = SingleInstanceLock(str(RUNTIME_DIR / "keep_watcher.lock"))
+    if not instance_lock.acquire():
+        print("Keep watcher is already running; this invocation will exit.")
+        return 0
+
+    print("AI Inbox に接続中...")
+    keep, inbox_source = get_inbox_client()
+    print(f"AI Inbox source: {inbox_source}")
+
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    cur = conn.cursor()
+    try:
+        ensure_schema(conn)
+        new_count = 0
+        for note in keep.all():
+            if getattr(note, "trashed", False):
+                continue
+            if process_note(conn, cur, keep, note, inbox_source):
+                new_count += 1
+    finally:
+        conn.close()
+
+    print()
+    print("=" * 60)
+    if new_count == 0:
+        print("新しいメモはありません")
+    else:
+        print(f"{new_count}件のメモを処理しました")
+    print("=" * 60)
+    return 0
 
 
-print()
-print("=" * 60)
-
-if new_count == 0:
-    print("新しいメモはありません")
-else:
-    print(f"{new_count}件のメモを処理しました")
-
-print("=" * 60)
+if __name__ == "__main__":
+    raise SystemExit(main())

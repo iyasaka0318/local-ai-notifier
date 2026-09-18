@@ -1,10 +1,12 @@
 import json
 import os
 import sys
+import threading
 import time
 
 import requests
 
+from control_listener import listen_forever as listen_for_commands
 from inbox_cycle import run_inbox_cycle
 from instance_lock import SingleInstanceLock
 from project_paths import CONFIG_DIR, RUNTIME_DIR, ensure_runtime_directories
@@ -76,12 +78,28 @@ def listen_forever(signal_url):
             retry_seconds = min(retry_seconds * 2, RECONNECT_MAX_SECONDS)
 
 
+def start_command_listener(topic):
+    """Watch the control topic in the background so undo works while idle."""
+    if not topic:
+        print("NTFY_TOPICが未設定のため、ワンタップ取り消しは無効です。", file=sys.stderr)
+        return None
+    thread = threading.Thread(
+        target=listen_for_commands,
+        args=(topic,),
+        name="ntfy-control-listener",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def main():
     ensure_runtime_directories()
     lock = SingleInstanceLock(str(RUNTIME_DIR / "tasks_event_listener.lock"))
     if not lock.acquire():
         print("Google Tasks起動信号リスナーは既に動作中です。")
         return 0
+    start_command_listener(os.environ.get("NTFY_TOPIC", "").strip())
     listen_forever(load_signal_url())
     return 0
 

@@ -32,6 +32,8 @@ from state_store import (
     ensure_schema,
     mark_note_processed,
     requeue_stale_running_jobs,
+    source_note_has_outstanding_work,
+    source_note_id_of,
     utc_now,
 )
 
@@ -419,6 +421,8 @@ def finish_source_note(
     source_note_id,
     tasks_factory=get_tasks_inbox_client,
 ):
+    item_id = source_note_id
+    source_note_id = source_note_id_of(item_id)
     source = conn.execute("""
         SELECT p.content_hash, a.automation_source
         FROM processed_notes AS p
@@ -426,6 +430,8 @@ def finish_source_note(
         WHERE p.note_id = ?
     """, (source_note_id,)).fetchone()
     if not source:
+        return
+    if source_note_has_outstanding_work(conn, source_note_id, exclude_item_id=item_id):
         return
     content_hash, automation_source = source
     if automation_source == "explicit_ai_memo":

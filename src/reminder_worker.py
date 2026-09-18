@@ -47,6 +47,35 @@ def latest_persistent_slot(now):
     return None
 
 
+def group_persistent_tasks(rows):
+    """Bundle grouped tasks together; ungrouped tasks stay one per bundle.
+
+    Sending "買い物: 牛乳 / パン / 卵" as one notification instead of three is
+    the whole point of grouping, so the delivery unit has to be the bundle.
+    """
+    bundles = []
+    by_group = {}
+    for row in rows:
+        group_name = row[4]
+        if not group_name:
+            bundles.append((None, [row]))
+            continue
+        if group_name not in by_group:
+            by_group[group_name] = []
+            bundles.append((group_name, by_group[group_name]))
+        by_group[group_name].append(row)
+    return bundles
+
+
+def format_group_message(group_name, task_texts):
+    if len(task_texts) == 1 and not group_name:
+        return task_texts[0]
+    lines = "\n".join(f"・{text}" for text in task_texts)
+    if group_name:
+        return f"{group_name}\n{lines}"
+    return lines
+
+
 def dispatch_persistent_reminders(conn, topic, now=None, sender=send_notification):
     now = now or datetime.now(LOCAL_TIMEZONE)
     slot = latest_persistent_slot(now)
@@ -54,62 +83,71 @@ def dispatch_persistent_reminders(conn, topic, now=None, sender=send_notificatio
         return 0
 
     rows = conn.execute("""
-        SELECT id, task_text, created_at, last_notified_slot
+        SELECT id, task_text, created_at, last_notified_slot, group_name
         FROM persistent_reminders
         WHERE status = 'active'
-        ORDER BY created_at, id
+        ORDER BY group_name IS NULL, group_name, created_at, id
     """).fetchall()
+
     sent = 0
-    for task_id, task_text, created_at, last_notified_slot in rows:
-        try:
-            created = parse_scheduled_at(created_at)
-        except (TypeError, ValueError):
-            created = now
-        if created.astimezone(LOCAL_TIMEZONE) > slot:
-            continue
-        if last_notified_slot:
+    for group_name, bundle in group_persistent_tasks(rows):
+        claimed = []
+        for task_id, task_text, created_at, last_notified_slot, _group in bundle:
             try:
-                if parse_scheduled_at(last_notified_slot) >= slot:
-                    continue
+                created = parse_scheduled_at(created_at)
             except (TypeError, ValueError):
-                pass
+                created = now
+            if created.astimezone(LOCAL_TIMEZONE) > slot:
+                continue
+            if last_notified_slot:
+                try:
+                    if parse_scheduled_at(last_notified_slot) >= slot:
+                        continue
+                except (TypeError, ValueError):
+                    pass
 
-        claimed_at = utc_now()
-        cursor = conn.execute("""
-            UPDATE persistent_reminders
-            SET last_notified_slot = ?, updated_at = ?
-            WHERE id = ? AND status = 'active' AND last_notified_slot IS ?
-        """, (slot.isoformat(), claimed_at, task_id, last_notified_slot))
-        conn.commit()
-        if cursor.rowcount == 0:
+            cursor = conn.execute("""
+                UPDATE persistent_reminders
+                SET last_notified_slot = ?, updated_at = ?
+                WHERE id = ? AND status = 'active' AND last_notified_slot IS ?
+            """, (slot.isoformat(), utc_now(), task_id, last_notified_slot))
+            conn.commit()
+            if cursor.rowcount:
+                claimed.append((task_id, task_text, last_notified_slot))
+
+        if not claimed:
             continue
 
+        message = format_group_message(group_name, [text for _, text, _ in claimed])
+        title = group_name or "リマインダー"
         try:
-            sender(topic, task_text, "リマインダー")
+            sender(topic, message, title)
         except Exception as error:
-            conn.execute("""
-                UPDATE persistent_reminders
-                SET last_notified_slot = ?, last_error = ?, updated_at = ?
-                WHERE id = ? AND status = 'active' AND last_notified_slot = ?
-            """, (
-                last_notified_slot,
-                str(error)[:2000],
-                utc_now(),
-                task_id,
-                slot.isoformat(),
-            ))
+            for task_id, _text, previous_slot in claimed:
+                conn.execute("""
+                    UPDATE persistent_reminders
+                    SET last_notified_slot = ?, last_error = ?, updated_at = ?
+                    WHERE id = ? AND status = 'active' AND last_notified_slot = ?
+                """, (
+                    previous_slot,
+                    str(error)[:2000],
+                    utc_now(),
+                    task_id,
+                    slot.isoformat(),
+                ))
             conn.commit()
             notify_processing_failure(
-                conn, topic, "継続リマインダー通知", task_id, error,
+                conn, topic, "継続リマインダー通知", claimed[0][0], error,
                 retrying=True, sender=sender,
             )
             continue
 
-        conn.execute("""
-            UPDATE persistent_reminders
-            SET last_error = NULL, updated_at = ?
-            WHERE id = ? AND status = 'active' AND last_notified_slot = ?
-        """, (utc_now(), task_id, slot.isoformat()))
+        for task_id, _text, _previous in claimed:
+            conn.execute("""
+                UPDATE persistent_reminders
+                SET last_error = NULL, updated_at = ?
+                WHERE id = ? AND status = 'active' AND last_notified_slot = ?
+            """, (utc_now(), task_id, slot.isoformat()))
         conn.commit()
         sent += 1
     return sent

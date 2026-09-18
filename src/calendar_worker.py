@@ -17,6 +17,8 @@ from reminder_worker import parse_scheduled_at
 from state_store import (
     ensure_schema,
     mark_note_processed,
+    source_note_has_outstanding_work,
+    source_note_id_of,
     requeue_stale_running_jobs,
     utc_now,
 )
@@ -216,16 +218,56 @@ def create_calendar_event_via_webhook(credentials, body, session=requests):
     }
 
 
+def delete_calendar_event(note_id, calendar_event_id, session=requests):
+    """Remove an event that the user undid.
+
+    Undo has to reach Google Calendar, not just the local row: an event the user
+    cancelled from the notification must not stay on their phone's calendar.
+    """
+    credentials = load_webhook_credentials()
+    if credentials:
+        response = session.post(
+            credentials["endpoint_url"],
+            json={
+                "action": "calendar_delete",
+                "secret": credentials["secret"],
+                "source_note_id": note_id,
+                "event_id": calendar_event_id,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not result.get("ok"):
+            raise RuntimeError(
+                f"カレンダー予定の削除に失敗しました: {result.get('error', '不明なエラー')}"
+            )
+        return True
+
+    access_token = get_access_token(session=session)
+    calendar_path = quote(CALENDAR_ID, safe="")
+    response = session.delete(
+        f"{API_ROOT}/calendars/{calendar_path}/events/{calendar_event_id}",
+        params={"sendUpdates": "none"},
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+    if response.status_code not in (200, 204, 404, 410):
+        response.raise_for_status()
+    return True
+
+
 def get_keep():
     return get_authenticated_keep()
 
 
 def finish_source_note(
     conn,
-    source_note_id,
+    item_id,
     keep_factory=get_keep,
     tasks_factory=get_tasks_inbox_client,
 ):
+    source_note_id = source_note_id_of(item_id)
     source = conn.execute("""
         SELECT p.content_hash, a.automation_source
         FROM processed_notes AS p
@@ -233,6 +275,10 @@ def finish_source_note(
         WHERE p.note_id = ?
     """, (source_note_id,)).fetchone()
     if not source:
+        return
+    if source_note_has_outstanding_work(conn, source_note_id, exclude_item_id=item_id):
+        # Other items from the same utterance are still queued. Completing the
+        # inbox entry now would hide work the user is still waiting for.
         return
     content_hash, automation_source = source
     if automation_source == "explicit_ai_memo":

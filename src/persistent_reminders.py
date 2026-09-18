@@ -9,6 +9,11 @@ def normalize_task_text(text):
     return re.sub(r"[\s　、。,.!！?？「」『』()（）]+", "", text)
 
 
+def normalize_group_name(value):
+    value = (value or "").strip()
+    return value or None
+
+
 def list_active_tasks(conn):
     return conn.execute("""
         SELECT id, task_text
@@ -18,10 +23,55 @@ def list_active_tasks(conn):
     """).fetchall()
 
 
-def add_task(conn, source_note_id, task_text, now=None):
+def list_active_tasks_with_group(conn):
+    return [
+        {"id": row[0], "task_text": row[1], "group_name": row[2]}
+        for row in conn.execute("""
+            SELECT id, task_text, group_name
+            FROM persistent_reminders
+            WHERE status = 'active'
+            ORDER BY group_name IS NULL, group_name, created_at, id
+        """).fetchall()
+    ]
+
+
+def list_active_groups(conn):
+    return [
+        row[0] for row in conn.execute("""
+            SELECT DISTINCT group_name FROM persistent_reminders
+            WHERE status = 'active' AND group_name IS NOT NULL
+            ORDER BY group_name
+        """).fetchall()
+    ]
+
+
+def complete_group(conn, group_name, command_note_id=None, now=None):
+    """Finish every task in one group, so "買い物終わった" clears the list."""
+    group_name = normalize_group_name(group_name)
+    if not group_name:
+        return []
+    now = now or utc_now()
+    rows = conn.execute("""
+        SELECT id, task_text FROM persistent_reminders
+        WHERE status = 'active' AND group_name = ?
+        ORDER BY created_at, id
+    """, (group_name,)).fetchall()
+    if not rows:
+        return []
+    conn.execute("""
+        UPDATE persistent_reminders
+        SET status = 'completed', completed_at = ?, completed_by_note_id = ?,
+            last_error = NULL, updated_at = ?
+        WHERE status = 'active' AND group_name = ?
+    """, (now, command_note_id, now, group_name))
+    return [{"id": row[0], "task_text": row[1]} for row in rows]
+
+
+def add_task(conn, source_note_id, task_text, now=None, group_name=None):
     now = now or utc_now()
     task_text = (task_text or "").strip()
     normalized = normalize_task_text(task_text)
+    group_name = normalize_group_name(group_name)
     if not normalized:
         raise ValueError("リマインドする内容がありません")
 
@@ -31,23 +81,30 @@ def add_task(conn, source_note_id, task_text, now=None):
         ORDER BY id LIMIT 1
     """, (normalized,)).fetchone()
     if existing:
+        if group_name:
+            conn.execute(
+                "UPDATE persistent_reminders SET group_name = ?, updated_at = ? "
+                "WHERE id = ? AND group_name IS NULL",
+                (group_name, now, existing[0]),
+            )
         return existing[0]
 
     conn.execute("""
         INSERT INTO persistent_reminders (
             source_note_id, task_text, normalized_text, status,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, 'active', ?, ?)
+            group_name, created_at, updated_at
+        ) VALUES (?, ?, ?, 'active', ?, ?, ?)
         ON CONFLICT(source_note_id) DO UPDATE SET
             task_text = excluded.task_text,
             normalized_text = excluded.normalized_text,
             status = 'active',
+            group_name = excluded.group_name,
             last_notified_slot = NULL,
             last_error = NULL,
             completed_at = NULL,
             completed_by_note_id = NULL,
             updated_at = excluded.updated_at
-    """, (source_note_id, task_text, normalized, now, now))
+    """, (source_note_id, task_text, normalized, group_name, now, now))
     return conn.execute(
         "SELECT id FROM persistent_reminders WHERE source_note_id = ?",
         (source_note_id,),

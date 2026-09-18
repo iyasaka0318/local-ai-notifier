@@ -120,6 +120,25 @@ function doPost(e) {
       return jsonResponse_({ok: true, task_id: taskId, status: 'completed'});
     }
 
+    if (request.action === 'calendar_delete') {
+      const targetNoteId = String(request.source_note_id || '').trim();
+      const properties = PropertiesService.getScriptProperties();
+      const jobKey = 'event_' + sha256Hex_(targetNoteId);
+      const eventId = String(request.event_id || '') || properties.getProperty(jobKey);
+      if (!eventId) {
+        return jsonResponse_({ok: true, deleted: false, reason: 'not_found'});
+      }
+      try {
+        const event = CalendarApp.getDefaultCalendar().getEventById(eventId);
+        if (event) event.deleteEvent();
+      } catch (deleteError) {
+        // An event the user already removed by hand is still a success here.
+        if (!String(deleteError).match(/not found|見つかりません/i)) throw deleteError;
+      }
+      properties.deleteProperty(jobKey);
+      return jsonResponse_({ok: true, deleted: true, event_id: eventId});
+    }
+
     const noteId = String(request.source_note_id || '').trim();
     const title = String(request.event_title || '').trim();
     if (!noteId || !title || !request.event_start) {
