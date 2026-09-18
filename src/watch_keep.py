@@ -45,6 +45,7 @@ from state_store import (
     note_content_hash,
     is_generated_note,
     item_id_for,
+    note_revision,
     list_pending_reminders,
     list_active_web_monitors,
     save_structured_item,
@@ -857,17 +858,19 @@ def apply_correction(conn, item, pending_calendar_deletes=None, now=None):
         ok, message = undo_action(conn, token, pending_calendar_deletes)
         if not ok:
             raise ValueError(message)
-        return {"summary": message, "detail": None}
+        return {"summary": message, "detail": None, "target_key": target["target_key"]}
 
-    item_id = target["item_id"]
+    item_id = target["target_key"]
     kind = target["kind"]
+    if target["undone"]:
+        raise ValueError(f"すでに取り消された操作は訂正できません: {target['summary']}")
 
     if action == "reschedule":
         scheduled_at = item.get("scheduled_at")
         if not scheduled_at:
             raise ValueError("変更後の日時を読み取れませんでした")
         if kind == "reminder":
-            conn.execute("""
+            cursor = conn.execute("""
                 UPDATE reminders
                 SET scheduled_at = ?, status = 'pending', notified_at = NULL,
                     last_error = NULL, updated_at = ?
@@ -875,7 +878,7 @@ def apply_correction(conn, item, pending_calendar_deletes=None, now=None):
                                                  'notified', 'sending')
             """, (scheduled_at, now, item_id))
         elif kind == "calendar":
-            conn.execute("""
+            cursor = conn.execute("""
                 UPDATE calendar_jobs
                 SET event_start = ?, status = 'pending', calendar_event_id = NULL,
                     last_error = NULL, updated_at = ?
@@ -883,9 +886,14 @@ def apply_correction(conn, item, pending_calendar_deletes=None, now=None):
             """, (scheduled_at, now, item_id))
         else:
             raise ValueError("この操作は日時を変更できません")
+        # Reporting success for an UPDATE that matched nothing would tell the
+        # user their correction landed when the row was already gone.
+        if cursor.rowcount == 0:
+            raise ValueError(f"変更対象が見つかりませんでした: {target['summary']}")
         return {
             "summary": f"{target['summary']}",
             "detail": _format_reminder_time(scheduled_at),
+            "target_key": item_id,
         }
 
     if action == "rewrite":
@@ -893,35 +901,37 @@ def apply_correction(conn, item, pending_calendar_deletes=None, now=None):
         if not new_text:
             raise ValueError("変更後の内容を読み取れませんでした")
         if kind == "reminder":
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE reminders SET summary = ?, updated_at = ? WHERE note_id = ?",
                 (new_text, now, item_id),
             )
         elif kind == "persistent_reminder":
-            conn.execute("""
+            cursor = conn.execute("""
                 UPDATE persistent_reminders
                 SET task_text = ?, normalized_text = ?, updated_at = ?
                 WHERE source_note_id = ? AND status = 'active'
             """, (new_text, normalize_task_text(new_text), now, item_id))
         elif kind == "todo":
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE todos SET summary = ?, updated_at = ? WHERE note_id = ?",
                 (new_text, now, item_id),
             )
         elif kind == "memo":
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE memos SET summary = ?, updated_at = ? WHERE note_id = ?",
                 (new_text, now, item_id),
             )
         elif kind == "calendar":
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE calendar_jobs SET event_title = ?, summary = ?, "
                 "status = 'pending', updated_at = ? WHERE note_id = ?",
                 (new_text, new_text, now, item_id),
             )
         else:
             raise ValueError("この操作は内容を変更できません")
-        return {"summary": new_text, "detail": None}
+        if cursor.rowcount == 0:
+            raise ValueError(f"変更対象が見つかりませんでした: {target['summary']}")
+        return {"summary": new_text, "detail": None, "target_key": item_id}
 
     raise ValueError("訂正の種類を判定できませんでした")
 
@@ -944,6 +954,19 @@ def process_item(conn, cur, item, item_id, source_note_id, ai_text, inbox_source
 
     if intent == "correction":
         outcome = apply_correction(conn, item, pending_calendar_deletes)
+        # Log the correction too. Without it, recent_actions keeps offering the
+        # pre-correction wording, so a second "さっきの" resolves against text
+        # the user already replaced.
+        record_action(
+            conn,
+            source_note_id=source_note_id,
+            item_id=item_id,
+            kind="correction",
+            summary=outcome["summary"],
+            detail=outcome["detail"],
+            note_revision=note_revision(conn, source_note_id),
+            target_key=outcome.get("target_key") or item_id,
+        )
         return {
             "kind": "correction",
             "summary": outcome["summary"],
@@ -1019,15 +1042,24 @@ def process_item(conn, cur, item, item_id, source_note_id, ai_text, inbox_source
         source_note_id=source_note_id,
     )
 
+    target_key = item_id
     if intent == "persistent_reminder":
         action = item.get("persistent_reminder_action")
         if action == "add":
-            add_persistent_task(
+            task_id = add_persistent_task(
                 conn,
                 item_id,
                 item.get("persistent_task_text"),
                 group_name=item.get("persistent_group"),
             )
+            # add_task deduplicates by wording and may hand back a row created
+            # by an earlier note. Undo has to reach that row, not this item id.
+            owner = conn.execute(
+                "SELECT source_note_id FROM persistent_reminders WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if owner:
+                target_key = owner[0]
         elif action == "complete":
             cleared = complete_group(
                 conn, item.get("persistent_task_text"), command_note_id=item_id
@@ -1069,6 +1101,8 @@ def process_item(conn, cur, item, item_id, source_note_id, ai_text, inbox_source
         summary=report_summary(item),
         detail=format_detail(item),
         fallback_reason=fallback_reason,
+        note_revision=note_revision(conn, source_note_id),
+        target_key=target_key,
     )
     return {
         "kind": intent,

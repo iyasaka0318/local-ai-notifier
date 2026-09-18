@@ -54,15 +54,23 @@ def record_action(
     summary,
     detail=None,
     fallback_reason=None,
+    note_revision=0,
+    target_key=None,
     now=None,
 ):
-    """Append one action and return its undo token."""
+    """Append one action and return its undo token.
+
+    ``note_revision`` pins the action to the generation of the note it came
+    from, and ``target_key`` names the row the undo has to reach when that is
+    not the item id itself (a deduplicated persistent reminder reuses an
+    existing row, so the item id points at nothing).
+    """
     token = new_token()
     conn.execute("""
         INSERT INTO action_log (
             token, source_note_id, item_id, kind, summary, detail,
-            fallback_reason, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            fallback_reason, created_at, note_revision, target_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         token,
         source_note_id,
@@ -72,6 +80,8 @@ def record_action(
         detail,
         fallback_reason,
         now or utc_now(),
+        note_revision,
+        target_key or item_id,
     ))
     return token
 
@@ -99,7 +109,8 @@ def recent_actions(conn, limit=12):
 
 def get_action(conn, token):
     row = conn.execute("""
-        SELECT token, source_note_id, item_id, kind, summary, detail, undone_at
+        SELECT token, source_note_id, item_id, kind, summary, detail, undone_at,
+               note_revision, target_key
         FROM action_log WHERE token = ?
     """, (token,)).fetchone()
     if row is None:
@@ -112,6 +123,8 @@ def get_action(conn, token):
         "summary": row[4],
         "detail": row[5],
         "undone": bool(row[6]),
+        "note_revision": row[7],
+        "target_key": row[8] or row[2],
     }
 
 
@@ -222,8 +235,20 @@ def undo_action(conn, token, pending_calendar_deletes=None, now=None):
     if action["undone"]:
         return True, f"すでに取り消し済みです: {action['summary']}"
 
+    # Item ids are positional within a note, so a re-classification can put a
+    # different item at the same id. Undoing across that boundary would cancel
+    # something the user never pointed at.
+    current = conn.execute(
+        "SELECT revision FROM processed_notes WHERE note_id = ?",
+        (action["source_note_id"],),
+    ).fetchone()
+    if current is not None and current[0] != action["note_revision"]:
+        return False, (
+            f"このメモは編集されたため、この取り消しは使えません: {action['summary']}"
+        )
+
     kind = action["kind"]
-    item_id = action["item_id"]
+    item_id = action["target_key"]
     try:
         if kind == "reminder":
             changed = _undo_reminder(conn, item_id)

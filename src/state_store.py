@@ -303,6 +303,12 @@ def ensure_schema(conn):
             undo_error TEXT
         )
     """)
+    _add_column(conn, "action_log", "note_revision INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "action_log", "target_key TEXT")
+    conn.execute(
+        "UPDATE action_log SET target_key = item_id WHERE target_key IS NULL"
+    )
+    _add_column(conn, "processed_notes", "revision INTEGER NOT NULL DEFAULT 0")
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_action_log_created
         ON action_log (created_at DESC)
@@ -455,18 +461,30 @@ def claim_note(conn, note_id, content_hash, updated_at=None):
         conn.commit()
         return False
 
+    # A changed note produces a new generation. Undo buttons issued for the
+    # previous generation refer to items that no longer exist at the same
+    # position, so the revision is what lets undo refuse them.
+    bump = 1 if (row is None or row[0] != content_hash) else 0
     conn.execute("""
         INSERT INTO processed_notes (
-            note_id, content_hash, updated_at, status, last_error
-        ) VALUES (?, ?, ?, 'processing', NULL)
+            note_id, content_hash, updated_at, status, last_error, revision
+        ) VALUES (?, ?, ?, 'processing', NULL, 1)
         ON CONFLICT(note_id) DO UPDATE SET
             content_hash = excluded.content_hash,
             updated_at = excluded.updated_at,
             status = 'processing',
-            last_error = NULL
-    """, (note_id, content_hash, updated_at))
+            last_error = NULL,
+            revision = processed_notes.revision + ?
+    """, (note_id, content_hash, updated_at, bump))
     conn.commit()
     return True
+
+
+def note_revision(conn, note_id):
+    row = conn.execute(
+        "SELECT revision FROM processed_notes WHERE note_id = ?", (note_id,)
+    ).fetchone()
+    return row[0] if row else 0
 
 
 def mark_note_processed(conn, note_id, content_hash, updated_at=None):

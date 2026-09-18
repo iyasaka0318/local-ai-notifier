@@ -7,6 +7,8 @@ closest intent that can still run unattended, and the substitution is reported
 back so the user can correct it with one more utterance.
 """
 
+from datetime import date, datetime
+
 
 # Reasons are user-facing and travel straight into the ntfy report.
 REMINDER_WITHOUT_TIME = "時刻が読み取れなかったので、継続リマインドとして保存しました。"
@@ -17,8 +19,39 @@ RESEARCH_WITHOUT_OBJECTIVE = "調べる対象が読み取れなかったので�
 MONITOR_WITHOUT_TARGET = "監視対象が読み取れなかったので、TODOとして保存しました。"
 
 
+UNPARSABLE_TIME = "日時を解釈できなかったので、継続リマインドとして保存しました。"
+UNPARSABLE_DATE = "日付を解釈できなかったので、TODOとして保存しました。"
+CALENDAR_NOT_READY = "予定として確定できなかったので、TODOとして保存しました。"
+
+
 def _blank(value):
     return not (value or "").strip()
+
+
+def _parsable_datetime(value):
+    """True only when the worker will actually be able to use this value.
+
+    Checking for a non-empty string is not enough: the classifier can return
+    "あした" or a malformed offset, which survives an emptiness check and then
+    strands the item in a status no worker selects.
+    """
+    if _blank(value):
+        return False
+    try:
+        datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _parsable_date(value):
+    if _blank(value):
+        return False
+    try:
+        date.fromisoformat(value.strip()[:10])
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
 
 
 def apply_intent_fallback(item):
@@ -26,7 +59,13 @@ def apply_intent_fallback(item):
     item = dict(item)
     intent = item.get("intent")
 
-    if intent == "reminder" and _blank(item.get("scheduled_at")):
+    if intent == "reminder" and not _parsable_datetime(item.get("scheduled_at")):
+        # Decide the reason before the field is cleared below, so the report
+        # distinguishes "no time was said" from "the time could not be read".
+        reason = (
+            REMINDER_WITHOUT_TIME if _blank(item.get("scheduled_at"))
+            else UNPARSABLE_TIME
+        )
         # A reminder with no resolvable time still has a task in it. Persistent
         # reminders are the one channel that carries a task with no due time.
         task_text = (
@@ -41,14 +80,27 @@ def apply_intent_fallback(item):
         item["persistent_task_text"] = task_text
         item["scheduled_at"] = None
         item["recurrence"] = None
-        return item, REMINDER_WITHOUT_TIME
+        return item, reason
 
-    if intent == "calendar" and (
-        _blank(item.get("event_start")) or _blank(item.get("event_title"))
-    ):
-        item["intent"] = "todo"
-        item["calendar_ready"] = False
-        return item, CALENDAR_WITHOUT_DATE
+    if intent == "calendar":
+        # calendar_worker only selects rows with calendar_ready = 1 and a usable
+        # start, so anything short of that would sit in waiting_information
+        # forever while its source note is already marked processed.
+        usable_start = (
+            _parsable_date(item.get("event_start"))
+            if item.get("all_day")
+            else _parsable_datetime(item.get("event_start"))
+        )
+        if _blank(item.get("event_title")) or not usable_start:
+            item["intent"] = "todo"
+            item["calendar_ready"] = False
+            return item, (
+                CALENDAR_WITHOUT_DATE if _blank(item.get("event_start"))
+                else UNPARSABLE_DATE
+            )
+        if not item.get("calendar_ready"):
+            item["intent"] = "todo"
+            return item, CALENDAR_NOT_READY
 
     if intent == "persistent_reminder":
         action = item.get("persistent_reminder_action")

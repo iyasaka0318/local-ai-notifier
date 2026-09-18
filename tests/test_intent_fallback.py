@@ -95,3 +95,64 @@ class IntentFallbackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecutabilityTests(unittest.TestCase):
+    """A non-empty field is not the same as a usable one.
+
+    calendar_worker only selects rows with calendar_ready = 1 and a parseable
+    start, and dispatch_due_reminders only selects 'pending'. Anything the
+    fallback lets through in a weaker state is stranded, while its source note
+    is already marked processed.
+    """
+
+    def test_calendar_not_ready_becomes_todo(self):
+        item, reason = apply_intent_fallback({
+            "intent": "calendar", "summary": "打合せ",
+            "event_title": "打合せ", "event_start": "2026-10-03T09:00:00+09:00",
+            "calendar_ready": False,
+        })
+        self.assertEqual(item["intent"], "todo")
+        self.assertIsNotNone(reason)
+
+    def test_an_unparseable_start_becomes_todo(self):
+        item, reason = apply_intent_fallback({
+            "intent": "calendar", "summary": "打合せ",
+            "event_title": "打合せ", "event_start": "来週", "calendar_ready": True,
+        })
+        self.assertEqual(item["intent"], "todo")
+        self.assertIn("解釈", reason)
+
+    def test_an_unparseable_reminder_time_becomes_persistent(self):
+        item, reason = apply_intent_fallback({
+            "intent": "reminder", "summary": "掃除",
+            "notification_text": "掃除", "scheduled_at": "あした",
+        })
+        self.assertEqual(item["intent"], "persistent_reminder")
+        self.assertIn("解釈", reason)
+
+    def test_an_all_day_date_only_start_is_accepted(self):
+        item, reason = apply_intent_fallback({
+            "intent": "calendar", "summary": "旅行", "event_title": "旅行",
+            "event_start": "2026-10-03", "all_day": True, "calendar_ready": True,
+        })
+        self.assertEqual(item["intent"], "calendar")
+        self.assertIsNone(reason)
+
+    def test_a_usable_calendar_item_is_untouched(self):
+        item, reason = apply_intent_fallback({
+            "intent": "calendar", "summary": "打合せ", "event_title": "打合せ",
+            "event_start": "2026-10-03T09:00:00+09:00", "calendar_ready": True,
+        })
+        self.assertEqual(item["intent"], "calendar")
+        self.assertIsNone(reason)
+
+    def test_the_reason_distinguishes_missing_from_unreadable(self):
+        _item, missing = apply_intent_fallback({
+            "intent": "reminder", "summary": "掃除", "notification_text": "掃除",
+        })
+        _item2, unreadable = apply_intent_fallback({
+            "intent": "reminder", "summary": "掃除",
+            "notification_text": "掃除", "scheduled_at": "あした",
+        })
+        self.assertNotEqual(missing, unreadable)
