@@ -17,7 +17,14 @@ CONFIG_FILE = os.environ.get(
     str(CONFIG_DIR / "tasks_event.json"),
 )
 RECONNECT_MAX_SECONDS = 60
-FALLBACK_CHECK_SECONDS = 6 * 60 * 60
+# This is the recovery path for input that arrives without a signal, which is
+# everything entered through Gemini. It used to be a distant backstop behind
+# Apps Script's own poll; now that the poll's only job was to reach ntfy from
+# Google - the one leg that hangs for tens of seconds - this timer is the
+# fallback, so it runs often enough to be one.
+FALLBACK_CHECK_SECONDS = int(
+    os.environ.get("AI_FALLBACK_CHECK_SECONDS", str(15 * 60))
+)
 
 
 def load_signal_url():

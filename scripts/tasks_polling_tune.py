@@ -68,8 +68,10 @@ def main():
     applied = call("tasks_polling_configure", **extra)
     print(f"  変更しました: {applied['trigger_count']}本 × {applied['interval_minutes']}分間隔")
     if applied["trigger_count"] == 0:
-        print("  警告: ポーリングを停止しました。Gemini経由の入力は")
-        print("        リスナー起動時と6時間ごとの保険確認でしか拾われません。")
+        print("  ポーリングを停止しました。Gemini経由の入力は、PC側の定期確認")
+        print("  （既定15分・AI_FALLBACK_CHECK_SECONDS で変更）が回収します。")
+        print("  この定期確認はリスナー内で動くので、先にリスナーを再起動してください:")
+        print("    systemctl --user restart local-ai-notifier-listener.service")
 
 
 if __name__ == "__main__":
