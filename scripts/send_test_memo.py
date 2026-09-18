@@ -47,7 +47,19 @@ def main():
     print(f"1回目: task_id={result.get('task_id')} "
           f"signalled={result.get('signalled')} duplicate={result.get('duplicate')}")
     if result.get("signalled") is False:
+        status = result.get("signal_status")
         print("警告: 取り込みは成功しましたが、ローカルへの合図に失敗しました。")
+        print(f"      HTTPステータス: {status}  試行回数: {result.get('signal_attempts')}")
+        if result.get("signal_error"):
+            print(f"      内容: {result['signal_error']}")
+        if status == 0:
+            print("      → Apps Scriptに起動信号URLが未設定です。")
+            print("        ./runtime/run-worker.sh scripts/tasks_event_setup.py --reuse")
+        elif status == 429:
+            print("      → ntfy.sh のレート制限です。Apps Scriptの送信元IPは")
+            print("        他の利用者と共有のため、一時的に弾かれることがあります。")
+        elif status is None:
+            print("      → Apps Scriptが古い可能性があります。再デプロイしてください。")
         print("      定期ポーリングが拾うので処理はされますが、最大30秒遅れます。")
 
     if args.twice:

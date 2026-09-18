@@ -19,6 +19,8 @@ const INGEST_REQUEST_PROPERTY_PREFIX = 'INGEST_';
 const INGEST_DEDUPE_MS = 10 * 60 * 1000;
 const INGEST_TITLE_MAX = 40;
 const AI_TASK_LIST_ID_PROPERTY = 'AI_TASK_LIST_ID';
+const SIGNAL_MAX_ATTEMPTS = 3;
+const SIGNAL_RETRY_DELAY_MS = 600;
 
 function doPost(e) {
   let lock = null;
@@ -104,6 +106,9 @@ function doPost(e) {
         ok: true,
         trigger_count: triggers.length,
         cooldown_ms: TASKS_POLL_COOLDOWN_MS,
+        signal_url_configured: Boolean(
+          properties.getProperty(TASKS_SIGNAL_URL_PROPERTY)
+        ),
         stats: stats,
       });
     }
@@ -166,17 +171,20 @@ function doPost(e) {
 
       // Signal immediately instead of waiting for the next poll. The task is
       // already stored, so a signal failure only costs latency, never data.
-      let signalled = false;
+      let signal = {ok: false, status: 0, error: 'not_attempted'};
       try {
-        signalled = sendTasksSignalDirect_(properties);
+        signal = sendTasksSignalDirect_(properties);
       } catch (signalError) {
-        signalled = false;
+        signal = {ok: false, status: -1, error: String(signalError).slice(0, 200)};
       }
       return jsonResponse_({
         ok: true,
         task_id: created.id,
         task_list_id: taskListId,
-        signalled: signalled,
+        signalled: signal.ok,
+        signal_status: signal.status,
+        signal_error: signal.error || null,
+        signal_attempts: signal.attempts || 1,
         duplicate: false,
       });
     }
@@ -315,26 +323,50 @@ function pollTasksAndSignal() {
  */
 function sendTasksSignalDirect_(properties) {
   const signalUrl = properties.getProperty(TASKS_SIGNAL_URL_PROPERTY);
-  if (!signalUrl) return false;
+  if (!signalUrl) {
+    return {ok: false, status: 0, error: 'signal_url_not_configured'};
+  }
 
-  const response = UrlFetchApp.fetch(signalUrl, {
-    method: 'post',
-    contentType: 'text/plain; charset=utf-8',
-    payload: 'tasks_changed',
-    headers: {
-      'Title': 'AI Inbox signal',
-      'Priority': '3',
-    },
-    muteHttpExceptions: true,
-  });
-  const status = response.getResponseCode();
-  if (status < 200 || status >= 300) return false;
-
-  // 状態ハッシュは意図的に更新しません。算出には避けたい全走査が必要で、
-  // 次回ポーリングが一度だけ重複合図を送るほうが安上がりです。
-  // 重複合図は処理済みタスクを再走査するだけで副作用はありません。
-  properties.setProperty(TASKS_SIGNAL_LAST_SENT_PROPERTY, String(Date.now()));
-  return true;
+  // ntfy.sh throttles by source IP, and Apps Script egress addresses are
+  // shared with every other script, so a rejection here is expected to be
+  // transient. Retry briefly rather than falling back to the slow poll.
+  let status = 0;
+  let lastError = '';
+  for (let attempt = 0; attempt < SIGNAL_MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = UrlFetchApp.fetch(signalUrl, {
+        method: 'post',
+        contentType: 'text/plain; charset=utf-8',
+        payload: 'tasks_changed',
+        headers: {
+          'Title': 'AI Inbox signal',
+          'Priority': '3',
+        },
+        muteHttpExceptions: true,
+      });
+      status = response.getResponseCode();
+      if (status >= 200 && status < 300) {
+        // 状態ハッシュは意図的に更新しません。算出には避けたい全走査が必要で、
+        // 次回ポーリングが一度だけ重複合図を送るほうが安上がりです。
+        // 重複合図は処理済みタスクを再走査するだけで副作用はありません。
+        properties.setProperty(TASKS_SIGNAL_LAST_SENT_PROPERTY, String(Date.now()));
+        return {ok: true, status: status, attempts: attempt + 1};
+      }
+      lastError = String(response.getContentText() || '').slice(0, 200);
+    } catch (fetchError) {
+      status = -1;
+      lastError = String(fetchError).slice(0, 200);
+    }
+    if (attempt + 1 < SIGNAL_MAX_ATTEMPTS) {
+      Utilities.sleep(SIGNAL_RETRY_DELAY_MS * (attempt + 1));
+    }
+  }
+  return {
+    ok: false,
+    status: status,
+    error: lastError || 'signal_failed',
+    attempts: SIGNAL_MAX_ATTEMPTS,
+  };
 }
 
 /** AI Inbox のリストIDをキャッシュし、毎回の全リスト走査を避けます。 */
