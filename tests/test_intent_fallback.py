@@ -1,6 +1,7 @@
 import unittest
 
 from intent_fallback import (
+    CORRECTION_WITHOUT_TARGET,
     CALENDAR_WITHOUT_DATE,
     REMINDER_WITHOUT_TIME,
     UNKNOWN_AS_MEMO,
@@ -86,6 +87,31 @@ class IntentFallbackTests(unittest.TestCase):
             "summary": "何かのタスク",
         })
         self.assertEqual(item["intent"], "todo")
+
+    def test_correction_without_target_becomes_memo(self):
+        item, reason = apply_intent_fallback({
+            "intent": "correction", "summary": "テスト",
+            "correction_target": None, "correction_action": None,
+        })
+        self.assertEqual(item["intent"], "memo")
+        self.assertEqual(item["summary"], "テスト")
+        self.assertEqual(reason, CORRECTION_WITHOUT_TARGET)
+
+    def test_correction_with_unknown_action_becomes_memo(self):
+        item, reason = apply_intent_fallback({
+            "intent": "correction", "summary": "さっきの",
+            "correction_target": "note-1", "correction_action": "edit",
+        })
+        self.assertEqual(item["intent"], "memo")
+        self.assertEqual(reason, CORRECTION_WITHOUT_TARGET)
+
+    def test_a_complete_correction_is_untouched(self):
+        item, reason = apply_intent_fallback({
+            "intent": "correction", "summary": "さっきのを取り消して",
+            "correction_target": "note-1", "correction_action": "cancel",
+        })
+        self.assertEqual(item["intent"], "correction")
+        self.assertIsNone(reason)
 
     def test_input_is_not_mutated(self):
         original = {"intent": "unknown", "summary": "x"}

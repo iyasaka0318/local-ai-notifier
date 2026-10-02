@@ -17,6 +17,9 @@ UNKNOWN_AS_MEMO = "内容を判断しきれなかったので、メモとして�
 PERSISTENT_WITHOUT_TEXT = "リマインドする内容が読み取れなかったので、メモとして保存しました。"
 RESEARCH_WITHOUT_OBJECTIVE = "調べる対象が読み取れなかったので、TODOとして保存しました。"
 MONITOR_WITHOUT_TARGET = "監視対象が読み取れなかったので、TODOとして保存しました。"
+CORRECTION_WITHOUT_TARGET = "訂正する対象が分からなかったので、メモとして保存しました。"
+
+CORRECTION_ACTIONS = ("cancel", "reschedule", "rewrite")
 
 
 UNPARSABLE_TIME = "日時を解釈できなかったので、継続リマインドとして保存しました。"
@@ -121,6 +124,14 @@ def apply_intent_fallback(item):
     if intent == "web_monitor" and _blank(item.get("summary")):
         item["intent"] = "todo"
         return item, MONITOR_WITHOUT_TARGET
+
+    if intent == "correction" and (
+        _blank(item.get("correction_target"))
+        or item.get("correction_action") not in CORRECTION_ACTIONS
+    ):
+        # apply_correction cannot run without both, and raising there fails the
+        # whole note. A short utterance like "テスト" is classified this way.
+        return _to_memo(item), CORRECTION_WITHOUT_TARGET
 
     if intent in (None, "", "unknown"):
         return _to_memo(item), UNKNOWN_AS_MEMO
