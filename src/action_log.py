@@ -90,10 +90,26 @@ def record_action(
     return token
 
 
+REQUEST_EXCERPT_CHARS = 400
+
+
 def recent_actions(conn, limit=12):
-    """Newest first, so the classifier can resolve 'さっき' by position."""
-    return [
-        {
+    """Newest first, so the classifier can resolve 'さっき' by position.
+
+    Each entry carries the words the user originally spoke (``request``), so a
+    later "さっきの監視のやつ" can be acted on with its names and numbers intact,
+    and a research entry carries its result so a follow-up can build on it.
+    """
+    entries = []
+    for row in conn.execute("""
+        SELECT a.token, a.item_id, a.kind, a.summary, a.detail, a.created_at,
+               a.undone_at, r.original_text
+        FROM action_log a
+        LEFT JOIN ai_results r ON r.note_id = a.item_id
+        ORDER BY a.created_at DESC, a.rowid DESC
+        LIMIT ?
+    """, (limit,)).fetchall():
+        entry = {
             "token": row[0],
             "item_id": row[1],
             "kind": row[2],
@@ -102,13 +118,17 @@ def recent_actions(conn, limit=12):
             "created_at": row[5],
             "undone": bool(row[6]),
         }
-        for row in conn.execute("""
-            SELECT token, item_id, kind, summary, detail, created_at, undone_at
-            FROM action_log
-            ORDER BY created_at DESC, rowid DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
-    ]
+        if row[7]:
+            entry["request"] = row[7][:REQUEST_EXCERPT_CHARS]
+        if row[2] == "research":
+            result = conn.execute("""
+                SELECT notification_text FROM research_jobs
+                WHERE source_note_id = ? AND notification_text IS NOT NULL
+            """, (row[1],)).fetchone()
+            if result:
+                entry["result"] = result[0][:REQUEST_EXCERPT_CHARS]
+        entries.append(entry)
+    return entries
 
 
 def get_action(conn, token):

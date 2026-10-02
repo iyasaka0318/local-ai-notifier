@@ -74,6 +74,8 @@ recorded, its text and, where relevant, a status or a scheduled time.
   as actual dates. recorded_at is when the user said it, which is not always when
   the thing happens: prefer scheduled_at or start for when something takes place.
 - When several records fit, prefer the most recent, and say so if they disagree.
+- summary reflects later corrections by the user. When text and summary disagree,
+  summary is the current version.
 - A cancelled or completed record is still a fact about the past; mention its
   status when it matters to the answer.
 - If calendar_available is false, the calendar could not be read: for a question

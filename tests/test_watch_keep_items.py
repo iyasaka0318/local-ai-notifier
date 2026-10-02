@@ -65,6 +65,8 @@ def item(intent, **overrides):
         "reminder_target_ids": [],
         "correction_target": None,
         "correction_action": None,
+        "correction_text": None,
+        "reference_target": None,
         "actions": [],
     }
     base.update(overrides)
@@ -405,3 +407,93 @@ class MonitorResolutionSearchTests(unittest.TestCase):
 
         self.assertFalse(resolved["target_found"])
         self.assertEqual(resolved["monitor_urls"], [])
+
+
+class ReferenceTests(MultiItemNoteTests):
+    """「さっきの〜」: a later request builds on, or amends, an earlier one."""
+
+    RESOLVED = {
+        "search_query": "q", "target_found": False, "found_url": None,
+        "monitor_urls": ["https://example.org/"], "reason": "",
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.resolved_for = []
+        patcher = mock.patch.object(
+            watch_keep, "resolve_web_monitor",
+            side_effect=lambda text: self.resolved_for.append(text) or dict(self.RESOLVED),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def register(self, note_id, text, *items):
+        self.run_note(FakeNote(note_id, text=text), list(items))
+        return self.reports[-1][0]["token"]
+
+    def test_recent_actions_carry_the_words_the_user_spoke(self):
+        self.register("w1", "第73回の参加登録が始まったら通知",
+                      item("web_monitor", summary="第73回の参加登録を監視"))
+        entry = watch_keep.recent_actions(self.conn)[0]
+        self.assertEqual(entry["kind"], "web_monitor")
+        self.assertEqual(entry["request"], "第73回の参加登録が始まったら通知")
+
+    def test_a_follow_up_names_what_it_referred_to_in_the_report(self):
+        token = self.register("w1", "第73回の参加登録が始まったら通知",
+                              item("web_monitor", summary="第73回の参加登録を監視"))
+        self.run_note(FakeNote("r1", text="さっきの監視のやつ今あるか調べて"), [
+            item("research", summary="第73回の参加登録が始まっているか調べる",
+                 reference_target=token),
+        ])
+        self.assertEqual(self.reports[-1][0]["detail"], "「第73回の参加登録を監視」を参照")
+
+    def test_an_unknown_reference_is_ignored(self):
+        self.run_note(FakeNote("r1", text="さっきのやつ調べて"), [
+            item("research", summary="調べる", reference_target="no-such-token"),
+        ])
+        self.assertIsNone(self.reports[-1][0]["detail"])
+
+    def test_a_watch_can_be_retargeted(self):
+        token = self.register("w1", "第73回の参加登録が始まったら通知",
+                              item("web_monitor", summary="第73回の参加登録を監視"))
+        self.run_note(FakeNote("c1", text="さっきの監視、発表申込の方にして"), [
+            item("correction", summary="監視対象を発表申込に変更する",
+                 correction_target=token, correction_action="rewrite",
+                 correction_text="第73回の発表申込が始まったら通知する"),
+        ])
+        # The new search is made for the corrected request, not for the
+        # sentence that asked for the correction.
+        self.assertEqual(self.resolved_for[-1], "第73回の発表申込が始まったら通知する")
+        monitors = self.conn.execute(
+            "SELECT note_id, request_text, status FROM web_monitors"
+        ).fetchall()
+        self.assertEqual(monitors, [("w1", "第73回の発表申込が始まったら通知する", "active")])
+
+    def test_an_addition_is_appended_and_visible_to_questions(self):
+        token = self.register("m1", "駐車場は3階のBの12番",
+                              item("memo", summary="駐車場は3階のBの12番"))
+        self.run_note(FakeNote("c1", text="この前のメモに、ゲートは北口って足しといて"), [
+            item("correction", summary="駐車場のメモに追記する",
+                 correction_target=token, correction_action="append",
+                 correction_text="ゲートは北口"),
+        ])
+        summary = self.conn.execute(
+            "SELECT summary FROM memos WHERE note_id = 'm1'"
+        ).fetchone()[0]
+        self.assertEqual(summary, "駐車場は3階のBの12番\nゲートは北口")
+        recorded = self.conn.execute(
+            "SELECT summary, original_text FROM ai_results WHERE note_id = 'm1'"
+        ).fetchone()
+        self.assertEqual(recorded, (
+            "駐車場は3階のBの12番\nゲートは北口", "駐車場は3階のBの12番\nゲートは北口",
+        ))
+
+    def test_a_rewrite_reaches_the_record_questions_read(self):
+        token = self.register("m1", "駐車場は3階", item("memo", summary="駐車場は3階"))
+        self.run_note(FakeNote("c1", text="さっきのメモ、3階じゃなくて4階"), [
+            item("correction", summary="メモを直す", correction_target=token,
+                 correction_action="rewrite", correction_text="駐車場は4階"),
+        ])
+        self.assertEqual(self.conn.execute(
+            "SELECT summary FROM ai_results WHERE note_id = 'm1'"
+        ).fetchone()[0], "駐車場は4階")

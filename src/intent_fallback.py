@@ -19,7 +19,7 @@ RESEARCH_WITHOUT_OBJECTIVE = "調べる対象が読み取れなかったので�
 MONITOR_WITHOUT_TARGET = "監視対象が読み取れなかったので、TODOとして保存しました。"
 CORRECTION_WITHOUT_TARGET = "訂正する対象が分からなかったので、メモとして保存しました。"
 
-CORRECTION_ACTIONS = ("cancel", "reschedule", "rewrite")
+CORRECTION_ACTIONS = ("cancel", "reschedule", "rewrite", "append")
 
 
 UNPARSABLE_TIME = "日時を解釈できなかったので、継続リマインドとして保存しました。"

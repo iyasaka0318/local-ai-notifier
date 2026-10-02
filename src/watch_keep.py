@@ -175,8 +175,11 @@ ITEM_SCHEMA = {   'type': 'object',
                       'correction_action': {   'type': ['string', 'null'],
                                                'enum': [   'reschedule',
                                                            'rewrite',
+                                                           'append',
                                                            'cancel',
-                                                           None]}},
+                                                           None]},
+                      'correction_text': {'type': ['string', 'null']},
+                      'reference_target': {'type': ['string', 'null']}},
     'required': [   'intent',
                     'summary',
                     'notification_text',
@@ -400,13 +403,55 @@ Rules:
 - For correction, set correction_target to the token of the matching entry in
   recent_actions and correction_action to one of:
   reschedule (a new time; put it in scheduled_at),
-  rewrite (new wording; put it in summary and notification_text),
+  rewrite (new wording),
+  append (keep what was recorded and add to it, such as "さっきのメモに〜も足し
+  といて"),
   cancel (undo it entirely).
-  Match on meaning and recency together: "さっきの" means the newest entry that
-  fits the description. If nothing matches safely, set correction_target null and
-  classify the note as whatever it describes on its own.
+  For rewrite and append, correction_text is the exact text that gets stored, and
+  nothing else: no description of the operation, no さっきの, no "〜に変更する".
+  rewrite: the complete new wording that replaces the old one.
+  append: only the added content. "この前のメモに、ゲートは北口って足しといて"
+  -> correction_text "ゲートは北口".
+  To retarget a web watch, use rewrite: correction_text is the complete corrected
+  watch request, built from that entry's request with the correction applied.
+  "さっきの監視、参加じゃなくて発表申込の方にして" against a watch for
+  "第73回EMB研究発表会の参加登録" -> correction_text
+  "第73回EMB研究発表会の発表申込が始まったら通知する".
+  summary may describe the correction in one Japanese sentence.
+  If nothing matches safely, set correction_target null and classify the note as
+  whatever it describes on its own.
+
+REFERRING TO AN EARLIER REQUEST
+recent_actions lists the user's latest requests, newest first. Each entry has a
+kind, a summary and usually "request", the words the user originally spoke.
+The user often points back at one of them instead of repeating it:
+"さっきの監視登録のやつ", "直近のリマインダー", "この前のメモ", "今のやつ",
+"前に言ったEMB研究会のやつ". Treat さっき, 直近, この前, 今の, 前に言った, 最後の
+and similar wording as the same thing.
+- When the reference names a kind (監視, 調べもの, メモ, リマインダー, 予定, TODO),
+  it means the newest entry of that kind, even when entries of other kinds were
+  made after it. A memo and a reminder spoken after a watch do not change what
+  "さっきの監視" refers to.
+- When it names content instead ("EMB研究会のやつ"), it means the entry whose
+  summary or request is about that content. If several fit, take the newest.
+- When it names neither, it means the newest entry that fits what is being asked.
+- Ignore entries with undone=true unless the user is clearly talking about one.
+For a correction, the matched token goes in correction_target as described above.
+For any other intent that builds on an earlier entry, such as
+"さっきの監視登録のやつ、今とりあえずあるか調べて" (research about the watched
+thing) or "さっきの調べもの、料金も調べて" (research that extends an earlier one),
+put the matched token in reference_target and write this item as a complete,
+self-contained request: carry over the names, numbers, editions and purpose from
+that entry's request into summary, into the research objective and requested
+items, and into every other text field. Never leave さっきの or a similar
+pointer in any field, summary included; downstream code sees only this item.
+"さっきの監視登録のやつ、今あるか調べて" against a watch for the 73rd EMB
+registration -> summary "第73回EMB研究発表会の参加登録が始まっているか調べる". For a follow-up to
+research, the objective covers what is newly asked, using the earlier entry's
+result only to stay specific.
+If no entry matches, set reference_target null and take the text as it stands.
 - For every intent other than correction, correction_target and correction_action
-  are null. For every intent other than persistent_reminder, persistent_group is
+  are null. For correction, reference_target is null. For every intent other than persistent_reminder, persistent_group is
   null.
 """
 
@@ -810,6 +855,10 @@ def format_detail(item):
         return _format_reminder_time(item["event_start"])
     if intent == "persistent_reminder" and item.get("persistent_group"):
         return item["persistent_group"]
+    if item.get("_reference_summary"):
+        # Shows which earlier request "さっきの" was taken to mean, so a wrong
+        # match is visible in the report instead of silently acted on.
+        return f"「{item['_reference_summary']}」を参照"
     return None
 
 
@@ -900,7 +949,10 @@ def apply_correction(conn, item, pending_calendar_deletes=None, now=None):
         }
 
     if action == "rewrite":
-        new_text = item.get("notification_text") or item.get("summary")
+        new_text = (
+            item.get("correction_text") or item.get("notification_text")
+            or item.get("summary")
+        )
         if not new_text:
             raise ValueError("変更後の内容を読み取れませんでした")
         if kind == "reminder":
@@ -930,13 +982,66 @@ def apply_correction(conn, item, pending_calendar_deletes=None, now=None):
                 "status = 'pending', updated_at = ? WHERE note_id = ?",
                 (new_text, new_text, now, item_id),
             )
+        elif kind == "web_monitor":
+            resolved = item.get("_resolved_monitor")
+            if resolved is None:
+                raise ValueError("監視対象の解決結果がありません")
+            cursor = conn.execute(
+                "SELECT id FROM web_monitors WHERE note_id = ?", (item_id,)
+            )
+            if cursor.fetchone() is None:
+                raise ValueError(f"変更対象が見つかりませんでした: {target['summary']}")
+            # Retargeting restarts the watch: the old search terms and pages
+            # belonged to the request the user has just replaced.
+            upsert_web_monitor(conn.cursor(), item_id, new_text, resolved)
+            _sync_recorded_text(conn, item_id, summary=new_text)
+            return {"summary": new_text, "detail": "監視対象を変更", "target_key": item_id}
         else:
             raise ValueError("この操作は内容を変更できません")
         if cursor.rowcount == 0:
             raise ValueError(f"変更対象が見つかりませんでした: {target['summary']}")
+        _sync_recorded_text(conn, item_id, summary=new_text)
         return {"summary": new_text, "detail": None, "target_key": item_id}
 
+    if action == "append":
+        addition = (item.get("correction_text") or item.get("summary") or "").strip()
+        if not addition:
+            raise ValueError("追記する内容を読み取れませんでした")
+        table = {"memo": "memos", "todo": "todos"}.get(kind)
+        if table is None:
+            raise ValueError("この操作には追記できません")
+        cursor = conn.execute(
+            f"UPDATE {table} SET summary = summary || ? , updated_at = ? WHERE note_id = ?",
+            ("\n" + addition, now, item_id),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError(f"追記対象が見つかりませんでした: {target['summary']}")
+        _sync_recorded_text(conn, item_id, appended=addition)
+        return {
+            "summary": addition,
+            "detail": f"「{target['summary']}」に追記",
+            "target_key": item_id,
+        }
+
     raise ValueError("訂正の種類を判定できませんでした")
+
+
+def _sync_recorded_text(conn, item_id, summary=None, appended=None):
+    """Keep ai_results in step with a correction.
+
+    Questions are answered from ai_results, so a rewrite or an addition that
+    only reached the per-kind table would be invisible to "〜だっけ".
+    """
+    if appended is not None:
+        conn.execute("""
+            UPDATE ai_results
+            SET summary = summary || ?, original_text = original_text || ?
+            WHERE note_id = ?
+        """, ("\n" + appended, "\n" + appended, item_id))
+    elif summary is not None:
+        conn.execute(
+            "UPDATE ai_results SET summary = ? WHERE note_id = ?", (summary, item_id)
+        )
 
 
 # =========================================================
@@ -1222,9 +1327,24 @@ def process_note(conn, cur, keep, note, inbox_source):
     for raw in items:
         routed, reason = apply_intent_fallback(raw)
         routed["_fallback_reason"] = reason
-        if routed["intent"] == "web_monitor":
+        referenced = get_action(conn, routed.get("reference_target") or "")
+        if referenced:
+            routed["_reference_summary"] = referenced["summary"]
+        retargets_monitor = (
+            routed["intent"] == "correction"
+            and routed.get("correction_action") == "rewrite"
+            and (get_action(conn, routed.get("correction_target") or "") or {}).get("kind")
+            == "web_monitor"
+        )
+        if routed["intent"] == "web_monitor" or retargets_monitor:
+            # A request that points back at an earlier one ("さっきの〜") only
+            # names its subject in the summary the classifier rewrote.
+            if retargets_monitor:
+                monitor_request = routed.get("correction_text") or routed["summary"]
+            else:
+                monitor_request = routed["summary"] if referenced else ai_text
             try:
-                routed["_resolved_monitor"] = resolve_web_monitor(ai_text)
+                routed["_resolved_monitor"] = resolve_web_monitor(monitor_request)
             except Exception as error:
                 print("Web監視の対象解決に失敗:", error)
                 mark_note_failed(conn, note.id, content_hash, error)
