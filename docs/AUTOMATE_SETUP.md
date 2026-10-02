@@ -37,7 +37,7 @@
 
 ### 2-1. 先に用意するもの
 
-**保存フォルダ** `/sdcard/Download/automate`（他のファイルを置かないこと。中身は全部「未送信メモ」として送られます）。
+**保存フォルダ** `Download/Automate`（内部ストレージ/Download/Automate。Automate では先頭に `/` を付けない。他のファイルを置かないこと。中身は全部「未送信メモ」として送られます）。
 ファイルは8番が自動で作ります。初回に「すべてのファイルへのアクセス」を求められたら許可します。
 
 **PC の設定ファイルにある3つの値**
@@ -78,8 +78,8 @@ null・0・空文字・空配列は偽なので、`x` だけで「中身があ�
 | 5 | `Expression true` | `=` `spoken && spoken[0] != ""` | YES → 6 ／ NO → 3 |
 | 6 | `Variable set` | Variable `text`、Value `=` `spoken[0]` | → 7 |
 | 7 | `Variable set` | Variable `requestId`、Value `=` `uuid4()` | → 8 |
-| 8 | `File write` | File `=` `"/sdcard/Download/automate/" ++ requestId ++ ".json"`、Content `=` `jsonEncode({"requestId": requestId, "text": text})`、Append オフ | → 9 |
-| 9 | `File list` | Path 定数 `/sdcard/Download/automate`、Filenames 変数名 `files` | → 10 |
+| 8 | `File write` | File `=` `"Download/Automate/" ++ requestId ++ ".json"`、Content `=` `jsonEncode({"requestId": requestId, "text": text})`、Append オフ | → 9 |
+| 9 | `File list` | Path 定数 `Download/Automate`、Filenames 変数名 `files` | → 10 |
 | 10 | `For each` | Container `=` `files`、Entry value 変数名 `path` | DO → 11 ／ OK → 3 |
 | 11 | `File read` | File `=` `path`、Text content 変数名 `saved` | → 12 |
 | 12 | `Variable set` | Variable `q`、Value `=` `jsonDecode(saved)` | → 13 |
@@ -89,7 +89,7 @@ null・0・空文字・空配列は偽なので、`x` だけで「中身があ�
 | 16 | `File delete` | Path `=` `path`、Recursive オフ | → 17 |
 | 17 | `Vibrate` | 既定のまま | → 18 |
 | 18 | `HTTP request`（起動合図） | 下記 | → 10 |
-| 19 | `Notification show` | Title 定数 `AIメモ送信失敗`、Message 定数 `次に話したときに再送します` | → 3 |
+| 19 | `Notification show` | Title 定数 `AIメモ送信失敗`、Message `=` `"status=" ++ status ++ " body=" ++ body` | → 3 |
 
 線は必ず「出口の丸（OK / YES / NO / DO / FAIL）→ 相手の `IN`」の向きに引きます。丸の位置は公式に
 記載がないので、丸の横の名前で見分けます。`IN` には複数の線を入れられます。
@@ -111,7 +111,7 @@ For each（10番）は `files` を1件ずつ `path` に入れて DO から出し
 | Request content type | `=` `"application/json"` |
 | Request content body | `=` 下記（`ここにsecret` を置き換える） |
 | Timeout | 定数 **60**（既定15秒では足りません） |
-| Save response | **`Don't save`（既定のまま）** |
+| Save response | **`Save as text`（既定の `Don't save` から変える）** |
 | Response status code | 変数名 `status` |
 | Response content | 変数名 `body` |
 
@@ -119,7 +119,7 @@ For each（10番）は `files` を1件ずつ `path` に入れて DO から出し
 jsonEncode({"secret": "ここにsecret", "action": "tasks_ingest", "text": q["text"], "request_id": q["requestId"]})
 ```
 
-`Save to file` にすると `body` に本文ではなくファイルのパスが入り、14番が失敗します。
+既定の `Don't save` は本文を保存しないので、`status=200` でも `body` が空になり15番が必ず NO になります（実機で確認）。`Save to file` は `body` にパスが入るので不可。本文を変数に入れる選択肢を選びます。
 **Apps Script は認証失敗も HTTP 200 で返す**ので、15番で `res["ok"]` まで確認します。
 
 **18番 HTTP request（起動合図）**
@@ -149,7 +149,7 @@ Automate 左上メニュー → Settings → Run on system startup をオン
 
 ### 2-6. 組み終わったら確認する
 
-1. 「テスト」と話す → バイブが鳴り、`/sdcard/Download/automate` が空になる
+1. 「テスト」と話す → バイブが鳴り、内部ストレージの `Download/Automate` が空になる
 2. 機内モードで話す → 通知が出て、ファイルが1つ残る
 3. 機内モードを切ってもう一度話す → バイブが2回鳴り、フォルダが空になる
 
