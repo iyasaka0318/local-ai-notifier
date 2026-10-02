@@ -497,3 +497,24 @@ class ReferenceTests(MultiItemNoteTests):
         self.assertEqual(self.conn.execute(
             "SELECT summary FROM ai_results WHERE note_id = 'm1'"
         ).fetchone()[0], "駐車場は4階")
+
+
+class ResearchDeliveryTests(unittest.TestCase):
+    def plan(self, request, actions):
+        return watch_keep.build_research_plan(
+            {"summary": "調べる", "actions": actions}, request
+        )
+
+    def test_a_bare_request_is_answered_by_notification(self):
+        research = {"type": "research", "objective": "天気", "requested_items": []}
+        self.assertEqual(
+            self.plan("群馬の今週末の天気を調べて", [research])["notify_mode"],
+            "after_completion",
+        )
+
+    def test_saving_to_keep_alone_does_not_add_a_notification(self):
+        actions = [
+            {"type": "research", "objective": "天気", "requested_items": []},
+            {"type": "save_memo"},
+        ]
+        self.assertEqual(self.plan("天気を調べてメモに残して", actions)["notify_mode"], "none")

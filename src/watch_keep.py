@@ -613,7 +613,12 @@ def build_research_plan(result, original_request=""):
     if notify:
         notify_at = notify.get("scheduled_at")
         notify_mode = "at_time" if notify_at else "after_completion"
-    elif "通知" in original_request or "教えて" in original_request:
+    elif (
+        "通知" in original_request or "教えて" in original_request
+        or not save_to_keep
+    ):
+        # A result that is neither sent nor saved reaches nobody. "〜調べて"
+        # with no delivery instruction means "tell me what you find".
         notify_mode = "after_completion"
     notification_content_mode = infer_research_notification_mode(
         original_request,
