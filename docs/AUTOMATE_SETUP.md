@@ -62,6 +62,8 @@ Gmail の下書きや Google Keep 経由でスマホに渡し、**貼り終わ�
 
 定数モードのまま `jsonEncode({…})` を書くと保存できません。
 
+**`=` の欄に文字を書くときは `"…"` で囲みます**（例：`"text/plain"`）。最初から `=` が付いている欄や、定数モードでは候補からしか選べない欄（Content type など）もこの書き方で通ります。
+
 式の書き方：等価は `=`、論理積は `&&`、文字の連結は `++`。配列も辞書も `[ ]` で取り出します。
 null・0・空文字・空配列は偽なので、`x` だけで「中身がある」を判定できます。
 
@@ -104,9 +106,9 @@ For each（10番）は `files` を1件ずつ `path` に入れて DO から出し
 
 | 欄 | 値 |
 |---|---|
-| Request URL | 定数 `endpoint_url` の値 |
+| Request URL | `endpoint_url` の値（`=` が付いていれば `"…"` で囲む） |
 | Request method | `POST` |
-| Request content type | 定数 `application/json` |
+| Request content type | `=` `"application/json"` |
 | Request content body | `=` 下記（`ここにsecret` を置き換える） |
 | Timeout | 定数 **60**（既定15秒では足りません） |
 | Save response | **`Don't save`（既定のまま）** |
@@ -124,12 +126,12 @@ jsonEncode({"secret": "ここにsecret", "action": "tasks_ingest", "text": q["te
 
 | 欄 | 値 |
 |---|---|
-| Request URL | 定数 `signal_url` の値 |
+| Request URL | `signal_url` の値（`=` が付いていれば `"…"` で囲む） |
 | Request method | `POST` |
-| Request content type | 定数 `text/plain` |
-| Request content body | 定数 `tasks_changed`（**`"` を付けない**） |
+| Request content type | `=` `"text/plain"` |
+| Request content body | `=` `"tasks_changed"`（**`"` で囲む**） |
 
-PC側は本文が `tasks_changed` と完全一致するときだけ動きます。定数モードで `"tasks_changed"` と書くと引用符まで送られ、無視されます。
+PC側は本文が `tasks_changed` と完全一致するときだけ動きます。`=` の欄では `"` は文字の区切りなので、送られるのは `tasks_changed` だけです。囲まないと未定義の変数として弾かれます。
 
 ### 2-4. この形にしている理由
 
