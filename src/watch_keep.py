@@ -18,6 +18,7 @@ from calendar_worker import delete_calendar_event
 from classification_output import rewrite_classification_output
 from intent_fallback import apply_intent_fallback
 from llm_client import ask_llm
+from memo_qa import answer_question
 from monitor_llm import generate_search_queries
 from instance_lock import SingleInstanceLock
 from inbox_client import get_inbox_client
@@ -105,7 +106,8 @@ ITEM_SCHEMA = {   'type': 'object',
                                                 'wake_briefing',
                                                 'research',
                                                 'unknown',
-                                                'correction']},
+                                                'correction',
+                                                'question']},
                       'summary': {'type': 'string'},
                       'notification_text': {'type': ['string', 'null']},
                       'event_title': {'type': ['string', 'null']},
@@ -281,6 +283,12 @@ Intents:
 - correction: the user is fixing something they just said, such as
   "さっきのリマインダー9時じゃなくて10時" or "今の予定やっぱりなし". Match the
   request against recent_actions and put that entry's token in correction_target.
+- question: the user asks about something they recorded or scheduled before,
+  such as "駐車場どこって言ったっけ", "次の歯医者いつだっけ" or "牛乳のリマインド
+  まだ残ってる？". The answer comes from their own memos, reminders, calendar and
+  earlier results, not from the web. Asking for outside information ("〜を調べて",
+  the weather, a price, opening hours) is research, not question. Put the question
+  itself, restated as one complete Japanese sentence, in summary.
 - unknown: only when the text carries no request at all.
 
 Rules:
@@ -929,7 +937,7 @@ def apply_correction(conn, item, pending_calendar_deletes=None, now=None):
 # =========================================================
 
 # Intents that publish their own notification, so the execution report skips them.
-SELF_REPORTING_INTENTS = {"web_monitor_manage", "reminder_manage"}
+SELF_REPORTING_INTENTS = {"web_monitor_manage", "reminder_manage", "question"}
 # Intents whose real work happens in a later worker in the same cycle.
 DOWNSTREAM_INTENTS = {"wake_briefing", "research"}
 
@@ -1117,6 +1125,8 @@ def run_side_effects(conn, item, item_id):
         and item.get("persistent_reminder_action") == "notify_now"
     ):
         dispatch_persistent_now(conn, NTFY_TOPIC, item_id)
+    elif intent == "question":
+        send_notification(NTFY_TOPIC, item["_answer"]["text"], title="メモへの回答")
 
 
 # =========================================================
@@ -1210,6 +1220,19 @@ def process_note(conn, cur, keep, note, inbox_source):
                 routed["_resolved_monitor"] = resolve_web_monitor(ai_text)
             except Exception as error:
                 print("Web監視の対象解決に失敗:", error)
+                mark_note_failed(conn, note.id, content_hash, error)
+                return False
+        if routed["intent"] == "question":
+            # Answered before the transaction for the same reason: it reads the
+            # calendar over the network and calls the model. A lone question is
+            # asked in the user's own words; in a multi-item note the summary
+            # is the only text that isolates it.
+            try:
+                routed["_answer"] = answer_question(
+                    conn, ai_text if len(items) == 1 else routed["summary"]
+                )
+            except Exception as error:
+                print("メモへの質問の回答に失敗:", error)
                 mark_note_failed(conn, note.id, content_hash, error)
                 return False
         resolved_items.append(routed)

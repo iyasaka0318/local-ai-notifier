@@ -314,3 +314,60 @@ class SparseOutputTests(unittest.TestCase):
         ]})
         first["actions"].append("x")
         self.assertEqual(second["actions"], [])
+
+
+class QuestionTests(MultiItemNoteTests):
+    """A question is answered from the records and creates nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.sent = []
+        self.asked = []
+        for name, replacement in (
+            ("send_notification",
+             lambda topic, message, title="": self.sent.append((title, message))),
+            ("answer_question",
+             lambda conn, question: self.asked.append(question)
+             or {"found": True, "text": "3階のBの12番です。"}),
+        ):
+            patcher = mock.patch.object(watch_keep, name, side_effect=replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_the_answer_is_sent_and_nothing_is_recorded_as_a_memo(self):
+        note = FakeNote("q1", text="駐車場どこって言ったっけ")
+        self.assertTrue(self.run_note(note, [
+            item("question", summary="駐車場はどこだと言ったか"),
+        ]))
+        self.assertEqual(self.sent, [("メモへの回答", "3階のBの12番です。")])
+        self.assertEqual(self.rows("memos"), [])
+        self.assertEqual(self.reports, [])
+
+    def test_a_lone_question_is_asked_in_the_users_own_words(self):
+        note = FakeNote("q1", text="駐車場どこって言ったっけ")
+        self.run_note(note, [item("question", summary="駐車場はどこだと言ったか")])
+        self.assertEqual(self.asked, ["駐車場どこって言ったっけ"])
+
+    def test_a_question_beside_another_request_uses_its_summary(self):
+        note = FakeNote("q1", text="今日の予定なんだっけ、あと牛乳買うの覚えといて")
+        self.run_note(note, [
+            item("question", summary="今日の予定は何か"),
+            item("persistent_reminder", summary="牛乳を買う",
+                 persistent_reminder_action="add", persistent_task_text="牛乳を買う"),
+        ])
+        self.assertEqual(self.asked, ["今日の予定は何か"])
+        self.assertEqual([e["kind"] for e in self.reports[0]], ["persistent_reminder"])
+
+    def test_a_failed_answer_leaves_the_note_for_retry(self):
+        note = FakeNote("q1", text="駐車場どこって言ったっけ")
+        with mock.patch.object(
+            watch_keep, "answer_question", side_effect=RuntimeError("モデル停止")
+        ), mock.patch.object(watch_keep, "notify_processing_failure"):
+            self.assertFalse(self.run_note(note, [
+                item("question", summary="駐車場はどこだと言ったか"),
+            ]))
+        self.assertEqual(self.sent, [])
+        status = self.conn.execute(
+            "SELECT status FROM processed_notes WHERE note_id = 'q1'"
+        ).fetchone()
+        self.assertEqual(status, ("failed",))
