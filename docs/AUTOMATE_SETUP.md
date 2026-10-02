@@ -204,3 +204,38 @@ Gemini 経由の入力は、**PC側の定期確認**（既定15分・`AI_FALLBAC
 ```bash
 ./runtime/run-worker.sh scripts/show_inbox.py --details
 ```
+
+## 6. PC からスマホへの命令（アラーム）
+
+「明日7時にアラーム」のような依頼は、PC が ntfy の専用トピックに命令を送り、
+スマホの Automate が時計アプリにアラームを登録します。
+
+```
+PC → ntfy（<通知トピック>-phone）→ ntfy アプリ → ブロードキャスト → Automate → 時計アプリ
+```
+
+トピック名と鍵は次で表示します。どちらも認証情報です。
+
+```bash
+./runtime/run-worker.sh scripts/phone_command_setup.py
+```
+
+ntfy アプリでそのトピックを購読し、通知はミュートにします。memo とは別のフローを作ります。
+
+| # | ブロック | 設定 | 出口 |
+|---|---|---|---|
+| 1 | `Flow beginning` | そのまま | → 2 |
+| 2 | `Failure catch` | Retry limit 定数 `1000` | OK → 3 ／ FAIL → 3 |
+| 3 | `Broadcast receive` | Action `=` `"io.heckel.ntfy.MESSAGE_RECEIVED"`、Broadcast extras 変数名 `extras` | → 4 |
+| 4 | `Expression true` | `=` `extras["topic"] = "<トピック名>"` | YES → 5 ／ NO → 3 |
+| 5 | `Variable set` | Variable `cmd`、Value `=` `jsonDecode(extras["message"])` | → 6 |
+| 6 | `Expression true` | `=` `(cmd["key"] = "<鍵>") && (cmd["action"] = "alarm_add")` | YES → 7 ／ NO → 3 |
+| 7 | `Alarm add` | Time of day `=` `cmd["seconds"]`、Label `=` `cmd["label"]` | → 3 |
+
+- 時計アプリは時刻しか受け取れないため、24時間より先のアラームは PC が預かり、鳴る12時間前に送ります。
+- 繰り返しのアラームと時刻のないアラームは、リマインダーに振り替えます。
+- 登録済みのアラームは外から消せません。取り消しは、スマホに送る前のものだけ有効です。
+- 動作確認: `./runtime/run-worker.sh scripts/send_phone_test.py alarm_add seconds=27000 label=テスト`（7:30 のアラーム）
+
+実機（Redmi / HyperOS）で、`Alarm add` が時計アプリを開かずに登録できること、
+ntfy のブロードキャストが Automate に届くことを確認済みです。
