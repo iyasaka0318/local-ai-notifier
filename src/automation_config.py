@@ -8,10 +8,17 @@ VAGUE_TIMES = {
     "night": os.environ.get("AI_TIME_NIGHT", "20:00"),
 }
 
-MAX_RESEARCH_RESULTS = 12
-MAX_RESEARCH_PAGES = 3
+# Sized for a 32K-token context: Japanese runs about 0.72 tokens per character
+# (measured), so six pages of 4,500 characters plus the result list stay near
+# 23K tokens and leave room for the answer. The server refuses, rather than
+# truncates, a prompt that does not fit.
+MAX_RESEARCH_QUERIES = 4
+MAX_RESEARCH_RESULTS = 16
+MAX_RESEARCH_PAGES = 4
+MAX_FOLLOW_UP_QUERIES = 2
+MAX_FOLLOW_UP_PAGES = 2
 MAX_PAGE_BYTES = 1_000_000
-MAX_PAGE_TEXT_CHARS = 8_000
+MAX_PAGE_TEXT_CHARS = 4_500
 
 CALENDAR_TIMEZONE = os.environ.get("AI_CALENDAR_TIMEZONE", "Asia/Tokyo")
 CALENDAR_DEFAULT_MINUTES = int(

@@ -17,8 +17,11 @@ from ddgs import DDGS
 from failure_notifier import notify_processing_failure
 from automation_config import (
     MAX_PAGE_BYTES,
+    MAX_FOLLOW_UP_PAGES,
+    MAX_FOLLOW_UP_QUERIES,
     MAX_PAGE_TEXT_CHARS,
     MAX_RESEARCH_PAGES,
+    MAX_RESEARCH_QUERIES,
     MAX_RESEARCH_RESULTS,
 )
 from instance_lock import SingleInstanceLock
@@ -76,6 +79,7 @@ SUMMARY_SCHEMA = {
         "notification_summary": {"type": "string"},
         "notification_detailed": {"type": "string"},
         "unresolved_items": {"type": "array", "items": {"type": "string"}},
+        "follow_up_queries": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
         "result_text", "memo_title", "memo_text", "notification_title",
@@ -108,6 +112,57 @@ Create separate outputs for separate media:
   keep it under about 1,800 Japanese characters.
 
 Do not reuse the same long text for every field. All explanations must be Japanese.
+
+Resolve relative dates such as 今週末 or 来月 against current_datetime and state the
+actual dates. Sources with page_text were opened and read; the others are search
+snippets only and are weaker evidence.
+
+follow_up_queries: when unresolved_items is not empty and a different search could
+plausibly find the missing facts, give up to 2 new search queries that differ from
+the ones already used (see "query" on each source). Otherwise return an empty list.
+"""
+
+
+PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "queries": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+    },
+    "required": ["queries"],
+}
+
+PLAN_PROMPT = """
+You plan web searches for a Japanese user's research request. Return 2 to 4 search
+queries that together are most likely to surface the answer.
+
+- Write short keyword queries the way a skilled searcher would, not sentences.
+- Aim the first query at the official or primary source.
+- Resolve relative dates against current_datetime and put the actual date, month
+  or year in the query when the answer depends on it.
+- Cover each requested item with at least one query when the objective alone would
+  not surface it.
+- Use Japanese. Add one English query only when the subject is mainly documented in
+  English.
+- Do not repeat near-identical queries.
+"""
+
+
+SELECT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "read": {"type": "array", "items": {"type": "integer"}},
+    },
+    "required": ["read"],
+}
+
+SELECT_PROMPT = """
+You choose which search results to open for a research request. Return the "index"
+values of the results worth reading in full, best first, at most max_pages.
+
+Prefer official and primary sources, then pages whose snippet shows they contain
+the requested facts, then recent pages. Avoid opening two pages from the same site
+unless they cover different requested items. Skip login walls, video pages, pure
+link lists and results unrelated to the objective.
 """
 
 
@@ -165,6 +220,80 @@ def build_queries(objective, requested_items, base_query):
         if query and query not in unique:
             unique.append(query)
     return unique[:5]
+
+
+def _clean_queries(value, limit):
+    if not isinstance(value, list):
+        return []
+    unique = []
+    for query in value:
+        query = query.strip() if isinstance(query, str) else ""
+        if query and query not in unique:
+            unique.append(query)
+    return unique[:limit]
+
+
+def plan_queries(objective, requested_items, base_query, now):
+    """Ask the model for queries; fall back to the fixed pattern if it cannot."""
+    fallback = build_queries(objective, requested_items, base_query)
+    try:
+        plan = ask_llm(
+            PLAN_PROMPT,
+            {
+                "current_datetime": now.isoformat(),
+                "objective": objective,
+                "requested_items": requested_items,
+                "original_request": base_query or objective,
+            },
+            PLAN_SCHEMA,
+        )
+    except Exception as error:
+        print("検索クエリの計画に失敗（固定パターンで検索します）:", error)
+        return fallback
+    queries = _clean_queries(
+        plan.get("queries") if isinstance(plan, dict) else None,
+        MAX_RESEARCH_QUERIES,
+    )
+    return queries or fallback
+
+
+def select_pages(objective, requested_items, candidates, limit):
+    """Return candidates reordered so the pages worth reading come first."""
+    if len(candidates) <= limit:
+        return candidates
+    try:
+        choice = ask_llm(
+            SELECT_PROMPT,
+            {
+                "objective": objective,
+                "requested_items": requested_items,
+                "max_pages": limit,
+                "results": [
+                    {
+                        "index": index,
+                        "title": item["title"],
+                        "url": item["url"],
+                        "description": item["description"],
+                    }
+                    for index, item in enumerate(candidates)
+                ],
+            },
+            SELECT_SCHEMA,
+        )
+    except Exception as error:
+        print("読むページの選択に失敗（検索順に読みます）:", error)
+        return candidates
+    picked = []
+    for index in (choice.get("read") if isinstance(choice, dict) else None) or []:
+        if (
+            isinstance(index, int) and not isinstance(index, bool)
+            and 0 <= index < len(candidates) and index not in picked
+        ):
+            picked.append(index)
+    # Unpicked results stay behind the picks: they are the fallback when a
+    # chosen page cannot be fetched.
+    rest = [index for index in range(len(candidates)) if index not in picked]
+    return [candidates[index] for index in picked + rest]
 
 
 def search_web(queries):
@@ -256,17 +385,17 @@ def fetch_page_text(url):
     raise ValueError("too many redirects")
 
 
-def enrich_candidates(candidates):
+def enrich_candidates(candidates, limit=MAX_RESEARCH_PAGES):
     enriched = [dict(item) for item in candidates]
     fetched = 0
-    for offset in range(0, len(enriched), MAX_RESEARCH_PAGES):
-        if fetched >= MAX_RESEARCH_PAGES:
+    for offset in range(0, len(enriched), limit):
+        if fetched >= limit:
             break
-        batch = enriched[offset:offset + MAX_RESEARCH_PAGES]
+        batch = enriched[offset:offset + limit]
         with ThreadPoolExecutor(max_workers=len(batch)) as executor:
             futures = [executor.submit(fetch_page_text, item["url"]) for item in batch]
             for item, future in zip(batch, futures):
-                if fetched >= MAX_RESEARCH_PAGES:
+                if fetched >= limit:
                     future.cancel()
                     continue
                 try:
@@ -279,15 +408,11 @@ def enrich_candidates(candidates):
     return enriched
 
 
-def run_research(objective, requested_items, query, save_to_keep=False):
-    queries = build_queries(objective, requested_items, query)
-    candidates = search_web(queries)
-    if not candidates:
-        raise RuntimeError("Web検索結果がありません")
-    candidates = enrich_candidates(candidates)
-    result = ask_llm(
+def summarize_sources(objective, requested_items, candidates, save_to_keep, now):
+    return ask_llm(
         SUMMARY_PROMPT,
         {
+            "current_datetime": now.isoformat(),
             "objective": objective,
             "requested_items": requested_items,
             "sources": candidates,
@@ -295,6 +420,36 @@ def run_research(objective, requested_items, query, save_to_keep=False):
         },
         SUMMARY_SCHEMA,
     )
+
+
+def run_research(objective, requested_items, query, save_to_keep=False, now=None):
+    now = now or datetime.now(LOCAL_TIMEZONE)
+    queries = plan_queries(objective, requested_items, query, now)
+    candidates = search_web(queries)
+    if not candidates:
+        raise RuntimeError("Web検索結果がありません")
+    candidates = enrich_candidates(
+        select_pages(objective, requested_items, candidates, MAX_RESEARCH_PAGES)
+    )
+    result = summarize_sources(objective, requested_items, candidates, save_to_keep, now)
+
+    # One more round, and only when the first answer names both what is missing
+    # and a search that might find it.
+    follow_ups = _clean_queries(result.get("follow_up_queries"), MAX_FOLLOW_UP_QUERIES)
+    follow_ups = [query for query in follow_ups if query not in queries]
+    if follow_ups and result.get("unresolved_items"):
+        known = {item["url"] for item in candidates}
+        extra = [item for item in search_web(follow_ups) if item["url"] not in known]
+        extra = enrich_candidates(
+            select_pages(objective, requested_items, extra, MAX_FOLLOW_UP_PAGES),
+            MAX_FOLLOW_UP_PAGES,
+        )
+        if any(item.get("page_text") for item in extra):
+            candidates = candidates + extra
+            result = summarize_sources(
+                objective, requested_items, candidates, save_to_keep, now
+            )
+
     result = ensure_japanese_research_output(result)
     return result, [item["url"] for item in candidates]
 
