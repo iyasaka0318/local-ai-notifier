@@ -98,13 +98,18 @@ class TestDispatch(unittest.TestCase):
     def test_dispatch_sends_due_command(self):
         conn = make_conn()
         phone_commands.queue_phone_command(
-            conn.cursor(), "n1", "n1", "alarm_add", {"seconds": 60, "label": "x"}, NOW, now=NOW
+            conn.cursor(), "n1", "n1", "alarm_add", {"seconds": 60, "label": "x", "at": "2026-10-03T00:01:00+09:00"}, NOW, now=NOW
         )
         conn.commit()
         sender = FakeSender()
         result = phone_commands.dispatch_phone_commands(conn, "base", now=NOW, sender=sender)
         self.assertEqual(result, 1)
-        self.assertEqual(sender.calls, [("base", "alarm_add", {"seconds": 60, "label": "x"})])
+        self.assertEqual(len(sender.calls), 1)
+        topic, action, fields = sender.calls[0]
+        self.assertEqual(topic, "base")
+        self.assertEqual(action, "alarm_add")
+        self.assertEqual(fields["alarms"], [{"seconds": 60, "label": "x"}])
+        self.assertEqual(fields["seconds"], 60)
         row = conn.execute("SELECT status FROM phone_commands WHERE note_id = 'n1'").fetchone()
         self.assertEqual(row[0], "sent")
 
@@ -112,7 +117,7 @@ class TestDispatch(unittest.TestCase):
         conn = make_conn()
         send_after = NOW + timedelta(hours=1)
         phone_commands.queue_phone_command(
-            conn.cursor(), "n1", "n1", "alarm_add", {"seconds": 60, "label": "x"}, send_after, now=NOW
+            conn.cursor(), "n1", "n1", "alarm_add", {"seconds": 60, "label": "x", "at": "2026-10-03T00:01:00+09:00"}, send_after, now=NOW
         )
         conn.commit()
         sender = FakeSender()
@@ -130,7 +135,7 @@ class TestDispatch(unittest.TestCase):
     def test_dispatch_sender_error(self):
         conn = make_conn()
         phone_commands.queue_phone_command(
-            conn.cursor(), "n1", "n1", "alarm_add", {"seconds": 60, "label": "x"}, NOW, now=NOW
+            conn.cursor(), "n1", "n1", "alarm_add", {"seconds": 60, "label": "x", "at": "2026-10-03T00:01:00+09:00"}, NOW, now=NOW
         )
         conn.commit()
         sender = FakeSender(error=RuntimeError("boom"))
@@ -153,7 +158,7 @@ class TestDispatch(unittest.TestCase):
                 "n1",
                 "n1",
                 "alarm_add",
-                json.dumps({"seconds": 60, "label": "x"}, ensure_ascii=False),
+                json.dumps({"seconds": 60, "label": "x", "at": "2026-10-03T00:01:00+09:00"}, ensure_ascii=False),
                 NOW.isoformat(),
                 "sending",
                 created_at,
@@ -166,12 +171,39 @@ class TestDispatch(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(len(sender.calls), 1)
 
+    def test_due_alarms_go_out_as_one_command(self):
+        conn = make_conn()
+        phone_commands.queue_phone_command(
+            conn.cursor(), "n1", "n1", "alarm_add",
+            {"seconds": 25200, "label": "朝", "at": "2026-10-03T07:00:00+09:00"}, NOW, now=NOW
+        )
+        phone_commands.queue_phone_command(
+            conn.cursor(), "n2", "n2", "alarm_add",
+            {"seconds": 25500, "label": "朝", "at": "2026-10-03T07:05:00+09:00"}, NOW, now=NOW
+        )
+        conn.commit()
+        sender = FakeSender()
+        result = phone_commands.dispatch_phone_commands(conn, "base", now=NOW, sender=sender)
+        self.assertEqual(result, 2)
+        self.assertEqual(len(sender.calls), 1)
+        topic, action, fields = sender.calls[0]
+        self.assertEqual(fields["alarms"], [{"seconds": 25200, "label": "朝"}, {"seconds": 25500, "label": "朝"}])
+        self.assertEqual(fields["summary"], "10/3 07:00 朝\n10/3 07:05 朝")
+        row1 = conn.execute("SELECT status FROM phone_commands WHERE note_id = 'n1'").fetchone()
+        row2 = conn.execute("SELECT status FROM phone_commands WHERE note_id = 'n2'").fetchone()
+        self.assertEqual(row1[0], "sent")
+        self.assertEqual(row2[0], "sent")
+
+    def test_alarm_summary_omits_the_default_label(self):
+        result = phone_commands.alarm_summary([{"at": "2026-10-03T07:00:00+09:00", "label": "アラーム", "seconds": 25200}])
+        self.assertEqual(result, "10/3 07:00")
+
 
 class TestCancel(unittest.TestCase):
     def test_cancel_pending(self):
         conn = make_conn()
         phone_commands.queue_phone_command(
-            conn.cursor(), "n1", "n1", "alarm_add", {"seconds": 60, "label": "x"}, NOW, now=NOW
+            conn.cursor(), "n1", "n1", "alarm_add", {"seconds": 60, "label": "x", "at": "2026-10-03T00:01:00+09:00"}, NOW, now=NOW
         )
         conn.commit()
         result = phone_commands.cancel_phone_command(conn, "n1")
@@ -184,7 +216,7 @@ class TestCancel(unittest.TestCase):
     def test_cancel_sent(self):
         conn = make_conn()
         phone_commands.queue_phone_command(
-            conn.cursor(), "n1", "n1", "alarm_add", {"seconds": 60, "label": "x"}, NOW, now=NOW
+            conn.cursor(), "n1", "n1", "alarm_add", {"seconds": 60, "label": "x", "at": "2026-10-03T00:01:00+09:00"}, NOW, now=NOW
         )
         conn.commit()
         sender = FakeSender()

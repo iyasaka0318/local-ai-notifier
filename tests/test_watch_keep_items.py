@@ -619,3 +619,38 @@ class ReceiptTests(MultiItemNoteTests):
                  persistent_reminder_action="add", persistent_task_text="牛乳を買う"),
         ])
         self.assertEqual(len(self.reports), 1)
+
+
+class AlarmReceiptTests(AlarmTests):
+    def soon(self, minutes):
+        from datetime import datetime, timedelta
+        from phone_commands import LOCAL_TIMEZONE
+        return (datetime.now(LOCAL_TIMEZONE) + timedelta(minutes=minutes)).isoformat()
+
+    def test_an_alarm_that_goes_out_now_leaves_the_confirmation_to_the_phone(self):
+        self.run_note(FakeNote("a1", text="30分後にアラーム"), [
+            item("alarm", summary="30分後にアラーム", scheduled_at=self.soon(30)),
+        ])
+        self.assertEqual(self.reports, [])
+        self.assertEqual(len(self.sent), 1)
+
+    def test_several_rings_become_several_commands(self):
+        self.run_note(FakeNote("a1", text="7時から5分おきに3回"), [
+            item("alarm", summary="アラーム", scheduled_at=self.soon(60)),
+            item("alarm", summary="アラーム", scheduled_at=self.soon(65)),
+            item("alarm", summary="アラーム", scheduled_at=self.soon(70)),
+        ])
+        ids = [row[0] for row in self.conn.execute(
+            "SELECT note_id FROM phone_commands ORDER BY note_id"
+        )]
+        self.assertEqual(ids, ["a1", "a1#1", "a1#2"])
+        self.assertEqual(self.reports, [])
+
+    def test_held_alarms_are_reported_as_reserved(self):
+        self.run_note(FakeNote("a1", text="来年の元日7時と7時5分にアラーム"), [
+            item("alarm", summary="アラーム", scheduled_at="2099-01-01T07:00:00+09:00"),
+            item("alarm", summary="アラーム", scheduled_at="2099-01-01T07:05:00+09:00"),
+        ])
+        self.assertEqual(len(self.reports[0]), 2)
+        from report_notifier import format_report
+        self.assertEqual(format_report(self.reports[0])[0], "アラームを予約しました")

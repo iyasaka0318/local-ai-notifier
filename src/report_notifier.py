@@ -52,7 +52,11 @@ def format_report(entries):
             block += f"\n※ {entry['fallback_reason']}"
         blocks.append(block)
 
-    if len(entries) == 1:
+    if all(entry["kind"] == "alarm" for entry in entries):
+        # Only alarms that are being held reach this report; the phone itself
+        # confirms the ones it has set.
+        title = "アラームを予約しました"
+    elif len(entries) == 1:
         label = KIND_LABELS.get(entries[0]["kind"], entries[0]["kind"])
         title = f"{label}を登録しました"
     else:

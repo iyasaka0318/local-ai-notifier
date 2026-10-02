@@ -277,6 +277,16 @@ Intents:
   resolved ISO 8601 datetime with +09:00 and notification_text to a short label
   for the alarm (null when the user gave none). "通知して" and "リマインドして"
   without those words stay reminder.
+  One alarm item rings once. When the user asks for several rings, emit one alarm
+  item per ringing time, in time order, each with its own scheduled_at and the
+  same notification_text. Work the times out exactly:
+  "明日の朝7時から5分おきに3回" -> 07:00, 07:05, 07:10 (the first ring counts).
+  "明日の朝8時とそこから5分後、7分後" -> 08:00, 08:05, 08:07 (both measured from
+  the first time).
+  "明日の朝8時とそこから5分後、そこから2分後" -> 08:00, 08:05, 08:07 (each
+  そこから continues from the time just before it).
+  "7時と7時半にアラーム" -> 07:00, 07:30.
+  Drop a time that would repeat one already listed.
 - persistent_reminder: manages a locally saved task that has no specific due
   date/time and should remain active until the user says it is finished. It also
   covers commands to notify all currently saved persistent reminder tasks now.
@@ -1079,6 +1089,10 @@ DOWNSTREAM_INTENTS = {"wake_briefing", "research"}
 
 def answers_within_seconds(item):
     """True for requests whose result is itself the immediate notification."""
+    if item.get("intent") == "alarm":
+        # The phone confirms each alarm as it sets it, with the times. A held
+        # alarm keeps its receipt: nothing reaches the phone until the day before.
+        return bool(item.get("_alarm_goes_out_now"))
     return item.get("intent") == "wake_briefing" or (
         item.get("intent") == "persistent_reminder"
         and item.get("persistent_reminder_action") == "notify_now"
@@ -1239,6 +1253,8 @@ def process_item(conn, cur, item, item_id, source_note_id, ai_text, inbox_source
         if send_after > datetime.now(alarm_time.tzinfo):
             # Tell the user why the clock app does not show it yet.
             item["_alarm_detail"] += "（前日にスマホへ登録します）"
+        else:
+            item["_alarm_goes_out_now"] = True
 
     elif intent == "research":
         upsert_research_job(cur, item_id, build_research_plan(item, ai_text))

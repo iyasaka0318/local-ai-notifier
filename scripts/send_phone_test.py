@@ -14,6 +14,14 @@ fields = {}
 for pair in sys.argv[2:]:
     name, _, value = pair.partition("=")
     fields[name] = int(value) if value.isdigit() else value
+if action == "alarm_add" and "seconds" in fields:
+    # The flow reads the list; build it the way the dispatcher does.
+    seconds, label = fields["seconds"], fields.get("label", "テスト")
+    fields.update(
+        label=label,
+        alarms=[{"seconds": seconds, "label": label}],
+        summary=f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d} {label}",
+    )
 command = send_phone_command(
     os.environ["NTFY_TOPIC"], action, key=load_key(create=True), **fields
 )

@@ -138,8 +138,47 @@ def cancel_phone_command(conn, item_id):
     return "cancelled"
 
 
+def alarm_summary(alarms):
+    """One line per alarm, for the confirmation the phone shows after setting them."""
+    lines = []
+    for alarm in sorted(alarms, key=lambda alarm: alarm.get("at") or ""):
+        at = _parse(alarm["at"]).astimezone(LOCAL_TIMEZONE)
+        line = f"{at.month}/{at.day} {at:%H:%M}"
+        if alarm.get("label") and alarm["label"] != "アラーム":
+            line += f" {alarm['label']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _batches(rows):
+    """Group due alarms into one command; everything else goes out alone.
+
+    The phone's flow only listens between commands, so three alarms sent as
+    three messages a moment apart can lose one. One message carries them all.
+    """
+    alarms = [row for row in rows if row[1] == "alarm_add"]
+    others = [row for row in rows if row[1] != "alarm_add"]
+    batches = [([row[0]], row[1], json.loads(row[2])) for row in others]
+    if alarms:
+        payloads = sorted(
+            (json.loads(row[2]) for row in alarms), key=lambda alarm: alarm.get("at") or ""
+        )
+        fields = {
+            "alarms": [
+                {"seconds": alarm["seconds"], "label": alarm["label"]} for alarm in payloads
+            ],
+            "summary": alarm_summary(payloads),
+            # The first alarm is repeated at the top level for a flow that
+            # predates the list.
+            "seconds": payloads[0]["seconds"],
+            "label": payloads[0]["label"],
+        }
+        batches.append(([row[0] for row in alarms], "alarm_add", fields))
+    return batches
+
+
 def dispatch_phone_commands(conn, topic, now=None, sender=send_phone_command):
-    """Send every command that is due. Returns the number sent."""
+    """Send every command that is due. Returns the number of commands delivered."""
     now = now or datetime.now(LOCAL_TIMEZONE)
     sent = 0
     conn.execute("""
@@ -151,31 +190,35 @@ def dispatch_phone_commands(conn, topic, now=None, sender=send_phone_command):
         SELECT note_id, action, payload, send_after FROM phone_commands
         WHERE status = 'pending'
     """).fetchall()
-    for item_id, action, payload, send_after in rows:
-        if _parse(send_after) > now:
+    due = []
+    for row in rows:
+        if _parse(row[3]) > now:
             continue
         # Claim before sending so two workers cannot both deliver it.
         claimed = conn.execute("""
             UPDATE phone_commands
             SET status = 'sending', attempts = attempts + 1, claimed_at = ?
             WHERE note_id = ? AND status = 'pending'
-        """, (now.isoformat(), item_id))
+        """, (now.isoformat(), row[0]))
         conn.commit()
-        if claimed.rowcount == 0:
-            continue
+        if claimed.rowcount:
+            due.append(row)
+
+    for item_ids, action, fields in _batches(due):
+        placeholders = ",".join("?" for _ in item_ids)
         try:
-            sender(topic, action, **json.loads(payload))
+            sender(topic, action, **fields)
         except Exception as error:
-            conn.execute("""
+            conn.execute(f"""
                 UPDATE phone_commands SET status = 'pending', last_error = ?
-                WHERE note_id = ? AND status = 'sending'
-            """, (str(error)[:2000], item_id))
+                WHERE note_id IN ({placeholders}) AND status = 'sending'
+            """, (str(error)[:2000], *item_ids))
             conn.commit()
             continue
-        conn.execute("""
+        conn.execute(f"""
             UPDATE phone_commands SET status = 'sent', sent_at = ?, last_error = NULL
-            WHERE note_id = ?
-        """, (now.isoformat(), item_id))
+            WHERE note_id IN ({placeholders})
+        """, (now.isoformat(), *item_ids))
         conn.commit()
-        sent += 1
+        sent += len(item_ids)
     return sent

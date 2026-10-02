@@ -230,8 +230,14 @@ ntfy アプリでそのトピックを購読し、通知はミュートにしま
 | 4 | `Expression true` | `=` `extras["topic"] = "<トピック名>"` | YES → 5 ／ NO → 3 |
 | 5 | `Variable set` | Variable `cmd`、Value `=` `jsonDecode(extras["message"])` | → 6 |
 | 6 | `Expression true` | `=` `(cmd["key"] = "<鍵>") && (cmd["action"] = "alarm_add")` | YES → 7 ／ NO → 3 |
-| 7 | `Alarm add` | Time of day `=` `cmd["seconds"]`、Label `=` `cmd["label"]` | → 3 |
+| 7 | `For each` | Container `=` `cmd["alarms"]`、Entry value 変数名 `a` | DO → 8 ／ OK → 9 |
+| 8 | `Alarm add` | Time of day `=` `a["seconds"]`、Label `=` `a["label"]` | → 7 |
+| 9 | `Notification show` | Title 定数 `アラームを設定しました`、Message `=` `cmd["summary"]` | → 3 |
 
+- 「7時から5分おきに3回」のような複数のアラームは、1つの命令にまとめて送ります（`alarms` の配列）。
+  フローは命令と命令の間でしか待ち受けていないので、続けて3通送ると取りこぼすためです。
+- 設定できたことの通知は、スマホのフロー（9番）が出します。PC 側の受付通知は、
+  スマホへまだ送っていない預かり中のアラームにだけ出ます。
 - 時計アプリは時刻しか受け取れないため、24時間より先のアラームは PC が預かり、鳴る12時間前に送ります。
 - 繰り返しのアラームと時刻のないアラームは、リマインダーに振り替えます。
 - 登録済みのアラームは外から消せません。取り消しは、スマホに送る前のものだけ有効です。
