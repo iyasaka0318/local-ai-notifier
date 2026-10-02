@@ -684,7 +684,14 @@ def resolve_web_monitor(request_text):
     seen_urls = set()
     for query in queries:
         print(f"Web検索中: {query}")
-        for result in DDGS().text(query, max_results=8):
+        try:
+            found = list(DDGS().text(query, max_results=8))
+        except Exception as error:
+            # The search library raises when a query has no hits. One empty
+            # query, typically the exact-phrase one, must not discard the rest.
+            print("検索結果なし:", error)
+            continue
+        for result in found:
             url = result.get("href", "")
             if url and url not in seen_urls and len(results) < 12:
                 seen_urls.add(url)

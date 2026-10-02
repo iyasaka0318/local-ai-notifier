@@ -371,3 +371,37 @@ class QuestionTests(MultiItemNoteTests):
             "SELECT status FROM processed_notes WHERE note_id = 'q1'"
         ).fetchone()
         self.assertEqual(status, ("failed",))
+
+
+class MonitorResolutionSearchTests(unittest.TestCase):
+    def test_a_query_without_hits_does_not_discard_the_other_queries(self):
+        class FakeSearch:
+            def text(self, query, max_results=8):
+                if query.startswith('"'):
+                    raise RuntimeError("No results found.")
+                return [{"title": "公式", "href": "https://example.org/", "body": ""}]
+
+        with mock.patch.object(watch_keep, "DDGS", FakeSearch), mock.patch.object(
+            watch_keep, "generate_search_queries",
+            return_value=["第73回 参加登録", '"第73回" 参加登録'],
+        ), mock.patch.object(watch_keep, "ask_llm", return_value={
+            "target_found": False, "target_result_id": None,
+            "monitor_result_ids": [0], "reason": "まだ公開されていない",
+        }):
+            resolved = watch_keep.resolve_web_monitor("第73回の参加登録を見張って")
+
+        self.assertEqual(resolved["monitor_urls"], ["https://example.org/"])
+        self.assertEqual(resolved["search_query"], "第73回 参加登録")
+
+    def test_no_hits_at_all_registers_a_search_only_watch(self):
+        class EmptySearch:
+            def text(self, query, max_results=8):
+                raise RuntimeError("No results found.")
+
+        with mock.patch.object(watch_keep, "DDGS", EmptySearch), mock.patch.object(
+            watch_keep, "generate_search_queries", return_value=["a", "b"],
+        ):
+            resolved = watch_keep.resolve_web_monitor("見張って")
+
+        self.assertFalse(resolved["target_found"])
+        self.assertEqual(resolved["monitor_urls"], [])
