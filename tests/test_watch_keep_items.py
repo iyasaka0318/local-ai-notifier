@@ -584,3 +584,38 @@ class AlarmTests(MultiItemNoteTests):
         ok, message = watch_keep.undo_action(self.conn, self.reports[0][0]["token"])
         self.assertFalse(ok)
         self.assertIn("時計アプリ", message)
+
+
+class ReceiptTests(MultiItemNoteTests):
+    """No receipt when the result itself is the notification that follows."""
+
+    def test_a_wake_up_sends_no_receipt_but_is_still_logged(self):
+        self.run_note(FakeNote("w1", text="起きた"), [
+            item("wake_briefing", summary="起きた"),
+        ])
+        self.assertEqual(self.reports, [])
+        self.assertEqual(self.rows("wake_jobs"), [("w1", "w1", "pending")])
+        self.assertEqual(watch_keep.recent_actions(self.conn)[0]["kind"], "wake_briefing")
+
+    def test_notify_now_sends_no_receipt(self):
+        with mock.patch.object(watch_keep, "dispatch_persistent_now"):
+            self.run_note(FakeNote("p1", text="今のリマインダー送って"), [
+                item("persistent_reminder", summary="保存中のタスクを通知",
+                     persistent_reminder_action="notify_now"),
+            ])
+        self.assertEqual(self.reports, [])
+
+    def test_other_requests_in_the_same_note_keep_their_receipt(self):
+        self.run_note(FakeNote("w1", text="起きた、あと牛乳買うの覚えといて"), [
+            item("wake_briefing", summary="起きた"),
+            item("persistent_reminder", summary="牛乳を買う",
+                 persistent_reminder_action="add", persistent_task_text="牛乳を買う"),
+        ])
+        self.assertEqual([e["kind"] for e in self.reports[0]], ["persistent_reminder"])
+
+    def test_adding_a_task_still_sends_a_receipt(self):
+        self.run_note(FakeNote("p1", text="牛乳買うの覚えといて"), [
+            item("persistent_reminder", summary="牛乳を買う",
+                 persistent_reminder_action="add", persistent_task_text="牛乳を買う"),
+        ])
+        self.assertEqual(len(self.reports), 1)

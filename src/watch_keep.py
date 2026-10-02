@@ -1077,6 +1077,14 @@ SELF_REPORTING_INTENTS = {"web_monitor_manage", "reminder_manage", "question"}
 DOWNSTREAM_INTENTS = {"wake_briefing", "research"}
 
 
+def answers_within_seconds(item):
+    """True for requests whose result is itself the immediate notification."""
+    return item.get("intent") == "wake_briefing" or (
+        item.get("intent") == "persistent_reminder"
+        and item.get("persistent_reminder_action") == "notify_now"
+    )
+
+
 def process_item(conn, cur, item, item_id, source_note_id, ai_text, inbox_source,
                  ai_memo_explicit, pending_calendar_deletes=None):
     """Persist one work item. Returns (report_entry, needs_downstream)."""
@@ -1249,13 +1257,19 @@ def process_item(conn, cur, item, item_id, source_note_id, ai_text, inbox_source
         note_revision=note_revision(conn, source_note_id),
         target_key=target_key,
     )
-    return {
+    entry = {
         "kind": intent,
         "summary": report_summary(item),
         "detail": format_detail(item),
         "fallback_reason": fallback_reason,
         "token": token,
-    }, intent in DOWNSTREAM_INTENTS or (
+    }
+    if answers_within_seconds(item) and not fallback_reason:
+        # The briefing or the task list itself arrives seconds later, so a
+        # receipt saying it was requested is a second buzz with no information.
+        # The action is still logged; only the notification is dropped.
+        entry = None
+    return entry, intent in DOWNSTREAM_INTENTS or (
         intent == "calendar" and bool(item.get("calendar_ready"))
     )
 
