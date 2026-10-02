@@ -18,6 +18,7 @@ from calendar_worker import delete_calendar_event
 from classification_output import rewrite_classification_output
 from intent_fallback import apply_intent_fallback
 from llm_client import ask_llm
+from monitor_llm import generate_search_queries
 from instance_lock import SingleInstanceLock
 from inbox_client import get_inbox_client
 from output_policy import infer_research_notification_mode
@@ -459,31 +460,6 @@ def should_process_unmarked(text):
     )
 
 
-def classify_note(
-    text,
-    active_persistent_tasks=None,
-    active_web_monitors=None,
-    active_scheduled_reminders=None,
-):
-    result = ask_llm(
-        CLASSIFY_PROMPT,
-        {
-            "current_datetime": datetime.now().astimezone().isoformat(),
-            "timezone": "Asia/Tokyo",
-            "vague_time_defaults": VAGUE_TIMES,
-            "active_persistent_tasks": [
-                {"id": task_id, "task_text": task_text}
-                for task_id, task_text in (active_persistent_tasks or [])
-            ],
-            "active_web_monitors": active_web_monitors or [],
-            "active_scheduled_reminders": active_scheduled_reminders or [],
-            "text": text,
-        },
-        CLASSIFY_SCHEMA
-    )
-    return ensure_classification_japanese(result)
-
-
 def execute_web_monitor_management(conn, result, topic, sender=send_notification):
     action = result.get("web_monitor_action")
     if action == "list":
@@ -682,17 +658,29 @@ reason:
 """
 
 
+def monitor_search_queries(request_text):
+    """Search terms for a new watch; the raw sentence is the fallback."""
+    try:
+        queries = generate_search_queries(request_text)
+    except Exception as error:
+        print("検索クエリの生成に失敗（依頼文で検索します）:", error)
+        queries = []
+    return queries[:3] or [request_text + " 公式"]
+
+
 def resolve_web_monitor(request_text):
-    search_query = request_text + " 公式"
+    queries = monitor_search_queries(request_text)
+    search_query = queries[0]
 
-    print(f"Web検索中: {search_query}")
-
-    results = list(
-        DDGS().text(
-            search_query,
-            max_results=8
-        )
-    )
+    results = []
+    seen_urls = set()
+    for query in queries:
+        print(f"Web検索中: {query}")
+        for result in DDGS().text(query, max_results=8):
+            url = result.get("href", "")
+            if url and url not in seen_urls and len(results) < 12:
+                seen_urls.add(url)
+                results.append(result)
 
     if not results:
         return {

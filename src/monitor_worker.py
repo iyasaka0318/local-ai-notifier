@@ -9,6 +9,7 @@ from ddgs import DDGS
 from datetime import datetime
 from failure_notifier import notify_processing_failure
 from llm_client import ask_llm
+from monitor_llm import generate_search_queries, verify_found_page
 from instance_lock import SingleInstanceLock
 from state_store import ensure_schema, requeue_stale_found_monitors
 from project_paths import DB_PATH, RUNTIME_DIR, ensure_runtime_directories
@@ -45,100 +46,6 @@ def notify_phone(title, message, url=None):
     )
 
     response.raise_for_status()
-
-
-# =========================================================
-# AIに複数の検索クエリを作らせる
-# =========================================================
-
-QUERY_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "search_queries": {
-            "type": "array",
-            "items": {
-                "type": "string"
-            },
-            "minItems": 2,
-            "maxItems": 4
-        }
-    },
-    "required": [
-        "search_queries"
-    ]
-}
-
-
-QUERY_PROMPT = """
-あなたはWeb監視システムの検索クエリ作成担当です。
-出力する自然言語は、固有名詞を除き必ず日本語にしてください。
-
-ユーザーが待っているページを見つけるための
-検索エンジン向け検索語を2～4個作ってください。
-
-同じ意味でも少し異なる検索方法を用意します。
-
-ルール:
-
-- 「監視する」
-- 「通知する」
-- 「教えて」
-- 「リマインド」
-- 「公開されたら」
-- 「始まったら」
-
-などの依頼表現は検索語から除外する。
-
-イベント名、回数、固有名詞、目的は残す。
-
-1つ目:
-短く一般的な検索語。
-
-2つ目:
-イベント名など重要部分を引用符で囲んだ
-完全一致寄りの検索語。
-
-3つ目以降:
-語順や表現を少し変えた検索語。
-
-ユーザーが言っていない組織名や情報を
-勝手に追加しない。
-
-検索演算子 site: はここでは使わない。
-後続プログラムが自動で追加する。
-
-例:
-
-入力:
-第73回EMB研究発表会の参加登録開始を監視するリマインド
-
-出力例:
-[
-  "第73回EMB研究発表会 参加登録 公式",
-  "\\"第73回EMB研究発表会\\" 参加登録",
-  "第73回 EMB 研究発表会 参加登録"
-]
-"""
-
-
-def generate_search_queries(request_text):
-
-    result = ask_llm(
-        QUERY_PROMPT,
-        request_text,
-        QUERY_SCHEMA
-    )
-
-    queries = []
-
-    for q in result["search_queries"]:
-
-        q = q.strip()
-
-        if q and q not in queries:
-            queries.append(q)
-
-    return queries
 
 
 # =========================================================
@@ -642,6 +549,28 @@ for (
 
         found = candidates[idx]
 
+        # The match so far rests on a search snippet. Read the page itself
+        # before telling the user, so "coming soon" pages and past editions
+        # do not end the watch early.
+        try:
+            verification = verify_found_page(request_text, found)
+        except Exception as e:
+            print("本文での確認に失敗（見出しでの判定を採用します）:", e)
+            verification = {"confirmed": None, "evidence": ""}
+        print("本文での確認:", json.dumps(verification, ensure_ascii=False))
+
+        if verification["confirmed"] is False:
+            print("本文に目的の内容がないため、監視を続けます")
+            cur.execute("""
+            UPDATE web_monitors
+            SET last_checked_at = ?
+            WHERE id = ? AND status = 'active'
+            """, (datetime.now().isoformat(), job_id))
+            conn.commit()
+            continue
+
+        evidence = verification["evidence"] if verification["confirmed"] else ""
+
         # Claim completion before notification. If the monitor was cancelled
         # after the initial SELECT, this guarded transition fails and no stale
         # notification is sent.
@@ -685,6 +614,7 @@ for (
                     f"監視していたページを発見しました。\n\n"
                     f"目的: {request_text}\n"
                     f"ページ: {found['title']}"
+                    + (f"\n\n{evidence}" if evidence else "")
                 ),
                 found["url"]
             )

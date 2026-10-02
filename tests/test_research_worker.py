@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import research_worker
+import web_pages
 from state_store import ensure_schema, note_content_hash, upsert_research_job, utc_now
 
 
@@ -160,7 +161,7 @@ class ResearchWorkerTests(unittest.TestCase):
 
     def test_private_page_target_is_rejected(self):
         with self.assertRaises(ValueError):
-            research_worker.validate_public_url("http://127.0.0.1/private")
+            web_pages.validate_public_url("http://127.0.0.1/private")
 
     def test_body_without_header_charset_uses_detected_encoding(self):
         class Response:
@@ -170,7 +171,7 @@ class ResearchWorkerTests(unittest.TestCase):
 
         text = "発売日は10月3日です"
         self.assertEqual(
-            research_worker.decode_response_body(Response(), text.encode("utf-8")),
+            web_pages.decode_response_body(Response(), text.encode("utf-8")),
             text,
         )
 
