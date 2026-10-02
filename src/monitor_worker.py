@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 from ddgs import DDGS
 from datetime import datetime
 from failure_notifier import notify_processing_failure
-from automation_config import OLLAMA_THINK
+from llm_client import ask_llm
 from instance_lock import SingleInstanceLock
 from state_store import ensure_schema, requeue_stale_found_monitors
 from project_paths import DB_PATH, RUNTIME_DIR, ensure_runtime_directories
@@ -18,59 +18,8 @@ from project_paths import DB_PATH, RUNTIME_DIR, ensure_runtime_directories
 # 設定
 # =========================================================
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL = "qwen3:14b"
-
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 NTFY_URL = "https://ntfy.sh"
-
-
-# =========================================================
-# Ollama共通
-# =========================================================
-
-def ask_ollama(system_prompt, user_data, schema):
-
-    if isinstance(user_data, str):
-        user_content = user_data
-    else:
-        user_content = json.dumps(
-            user_data,
-            ensure_ascii=False
-        )
-
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": user_content
-            }
-        ],
-        "format": schema,
-        "keep_alive": "30m",
-        "think": OLLAMA_THINK,
-        "stream": False,
-        "options": {
-            "temperature": 0.1
-        }
-    }
-
-    response = requests.post(
-        OLLAMA_URL,
-        json=payload,
-        timeout=120
-    )
-
-    response.raise_for_status()
-
-    return json.loads(
-        response.json()["message"]["content"]
-    )
 
 
 # =========================================================
@@ -174,7 +123,7 @@ QUERY_PROMPT = """
 
 def generate_search_queries(request_text):
 
-    result = ask_ollama(
+    result = ask_llm(
         QUERY_PROMPT,
         request_text,
         QUERY_SCHEMA
@@ -387,7 +336,7 @@ def judge_results(
     candidates
 ):
 
-    return ask_ollama(
+    return ask_llm(
         TARGET_PROMPT,
         {
             "request": request_text,

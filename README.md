@@ -29,13 +29,13 @@ Linuxでは systemd のユーザーユニットで常駐・定期実行します
 | `local-ai-notifier-reminders.timer` | リマインダー配信（1分ごと） |
 | `local-ai-notifier-monitor.timer` | Web監視チェック |
 | `local-ai-notifier-backup.timer` | DBバックアップ（1日1回） |
-| `local-ai-notifier-ollama.service` | Ollamaサーバー |
+| `local-ai-notifier-strata.service` | Strata（ローカルLLMサーバー、`~/Strata`） |
 
 ## 処理の流れ
 
 1. `tasks_event_listener.py` がGoogle Tasksの更新信号を受信
 2. `inbox_cycle.py` が各ワーカーを順番に起動
-3. `watch_keep.py` が入力を整形し、Qwenで意図を分類
+3. `watch_keep.py` が入力を整形し、ローカルLLMで意図を分類
 4. 各ワーカーが調査・通知・カレンダー登録・監視などを実行
 5. 状態を `data/keep_state.db` に保存し、必要に応じてntfyへ通知
 
@@ -59,9 +59,9 @@ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 ./runtime/run-worker.sh scripts/show_inbox.py --details
 ```
 
-通常運用では環境変数 `NTFY_TOPIC` と、`config/` 内のローカル認証設定が必要です。QwenはOllamaの `qwen3:14b` を `http://localhost:11434` で利用します。
+通常運用では環境変数 `NTFY_TOPIC` と、`config/` 内のローカル認証設定が必要です。ローカルLLMは [Strata](https://github.com/Niko1221/Strata) の Qwen3.8-Flash-Next を OpenAI互換API（`http://127.0.0.1:8080/v1`、`AI_LLM_URL` で変更可）で利用します。呼び出しは `src/llm_client.py` に集約しています。
 
-構造化JSONを高速に生成するため、Ollamaのthinkingは既定で無効です。精度比較などでthinkingを戻す場合は `AI_OLLAMA_THINK=true` を設定してください。稼働中のSQLite DBは次のコマンドで整合性を保ったままバックアップできます。
+構造化JSONを高速に生成するため、thinkingは既定で無効です。精度比較などでthinkingを戻す場合は `AI_LLM_THINK=true` を設定してください。StrataのJSON出力は形式を強制しない方式のため、`llm_client.py` が形式を検証し、合わなければ3回まで再生成します。稼働中のSQLite DBは次のコマンドで整合性を保ったままバックアップできます。
 
 ```bash
 ./runtime/run-worker.sh scripts/backup_db.py

@@ -20,9 +20,9 @@ from automation_config import (
     MAX_PAGE_TEXT_CHARS,
     MAX_RESEARCH_PAGES,
     MAX_RESEARCH_RESULTS,
-    OLLAMA_THINK,
 )
 from instance_lock import SingleInstanceLock
+from llm_client import ask_llm
 from keep_client import get_authenticated_keep
 from tasks_client import get_tasks_inbox_client
 from output_policy import needs_japanese_rewrite
@@ -38,8 +38,6 @@ from state_store import (
 )
 
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL = "qwen3:14b"
 LOCAL_TIMEZONE = ZoneInfo("Asia/Tokyo")
 
 
@@ -65,27 +63,6 @@ class TextExtractor(HTMLParser):
 
     def text(self):
         return "\n".join(self.parts)
-
-
-def ask_ollama(system_prompt, user_data, schema):
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_data, ensure_ascii=False)},
-            ],
-            "format": schema,
-            "keep_alive": "30m",
-            "think": OLLAMA_THINK,
-            "stream": False,
-            "options": {"temperature": 0.1},
-        },
-        timeout=180,
-    )
-    response.raise_for_status()
-    return json.loads(response.json()["message"]["content"])
 
 
 SUMMARY_SCHEMA = {
@@ -157,7 +134,7 @@ USER_OUTPUT_FIELDS = (
 
 def ensure_japanese_research_output(result):
     if any(needs_japanese_rewrite(result.get(field)) for field in USER_OUTPUT_FIELDS):
-        result = ask_ollama(JAPANESE_REWRITE_PROMPT, result, SUMMARY_SCHEMA)
+        result = ask_llm(JAPANESE_REWRITE_PROMPT, result, SUMMARY_SCHEMA)
     english_fields = [
         field for field in USER_OUTPUT_FIELDS
         if needs_japanese_rewrite(result.get(field))
@@ -308,7 +285,7 @@ def run_research(objective, requested_items, query, save_to_keep=False):
     if not candidates:
         raise RuntimeError("Web検索結果がありません")
     candidates = enrich_candidates(candidates)
-    result = ask_ollama(
+    result = ask_llm(
         SUMMARY_PROMPT,
         {
             "objective": objective,

@@ -85,24 +85,6 @@ class ResearchWorkerTests(unittest.TestCase):
             FROM research_jobs WHERE id = ?
         """, (job_id,)).fetchone()
 
-    def test_ollama_structured_requests_disable_thinking_by_default(self):
-        response = Mock()
-        response.json.return_value = {
-            "message": {"content": '{"status": "ok"}'},
-        }
-        schema = {
-            "type": "object",
-            "properties": {"status": {"type": "string"}},
-            "required": ["status"],
-        }
-
-        with patch.object(research_worker.requests, "post", return_value=response) as post:
-            result = research_worker.ask_ollama("system", {"input": "test"}, schema)
-
-        self.assertEqual(result, {"status": "ok"})
-        self.assertFalse(post.call_args.kwargs["json"]["think"])
-        response.raise_for_status.assert_called_once_with()
-
     def test_research_completion_notifies_and_finalizes_source(self):
         job = self.add_job()
         sent = []
@@ -213,7 +195,7 @@ class ResearchWorkerTests(unittest.TestCase):
             "notification_detailed": "調査結果の詳細です。",
             "unresolved_items": [],
         }
-        with patch.object(research_worker, "ask_ollama", return_value=japanese):
+        with patch.object(research_worker, "ask_llm", return_value=japanese):
             result = research_worker.ensure_japanese_research_output(english)
         self.assertEqual(result["memo_title"], "調査結果")
         self.assertEqual(result["notification_title"], "調査完了")

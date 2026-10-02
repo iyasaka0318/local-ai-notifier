@@ -2,7 +2,6 @@ import os
 import json
 import sqlite3
 import sys
-import requests
 from ddgs import DDGS
 from datetime import datetime
 
@@ -14,10 +13,11 @@ from action_log import (
     undo_action,
 )
 from ai_memo import is_ready_to_trash, parse_ai_memo, trash_processed_ai_memo
-from automation_config import OLLAMA_THINK, VAGUE_TIMES
+from automation_config import VAGUE_TIMES
 from calendar_worker import delete_calendar_event
 from classification_output import rewrite_classification_output
 from intent_fallback import apply_intent_fallback
+from llm_client import ask_llm
 from instance_lock import SingleInstanceLock
 from inbox_client import get_inbox_client
 from output_policy import infer_research_notification_mode
@@ -67,8 +67,6 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(errors="backslashreplace")
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL = "qwen3:14b"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 if not NTFY_TOPIC:
     raise RuntimeError("NTFY_TOPIC is required")
@@ -86,49 +84,6 @@ def mark_note_failed(conn, note_id, content_hash, error):
         retrying=True,
     )
 
-
-
-# =========================================================
-# 共通: OllamaにJSONを返させる
-# =========================================================
-
-def ask_ollama(system_prompt, user_data, schema):
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": (
-                    user_data
-                    if isinstance(user_data, str)
-                    else json.dumps(user_data, ensure_ascii=False)
-                )
-            }
-        ],
-        "format": schema,
-        "keep_alive": "30m",
-        "think": OLLAMA_THINK,
-        "stream": False,
-        "options": {
-            "temperature": 0.1
-        }
-    }
-
-    response = requests.post(
-        OLLAMA_URL,
-        json=payload,
-        timeout=120
-    )
-
-    response.raise_for_status()
-
-    content = response.json()["message"]["content"]
-
-    return json.loads(content)
 
 
 # =========================================================
@@ -466,7 +421,7 @@ Return the same JSON structure using the supplied schema.
 def ensure_classification_japanese(result):
     return rewrite_classification_output(
         result,
-        lambda value: ask_ollama(
+        lambda value: ask_llm(
             JAPANESE_REWRITE_PROMPT,
             value,
             CLASSIFY_SCHEMA,
@@ -475,7 +430,7 @@ def ensure_classification_japanese(result):
 
 
 def should_process_unmarked(text):
-    return ask_ollama(
+    return ask_llm(
         AUTOMATION_GATE_PROMPT,
         text,
         AUTOMATION_GATE_SCHEMA,
@@ -488,7 +443,7 @@ def classify_note(
     active_web_monitors=None,
     active_scheduled_reminders=None,
 ):
-    result = ask_ollama(
+    result = ask_llm(
         CLASSIFY_PROMPT,
         {
             "current_datetime": datetime.now().astimezone().isoformat(),
@@ -736,7 +691,7 @@ def resolve_web_monitor(request_text):
             "description": r.get("body", "")
         })
 
-    decision = ask_ollama(
+    decision = ask_llm(
         RESOLVE_PROMPT,
         {
             "request": request_text,
@@ -796,7 +751,7 @@ def classify_note(
     active_persistent_groups=None,
     recent=None,
 ):
-    result = ask_ollama(
+    result = ask_llm(
         CLASSIFY_PROMPT,
         {
             "current_datetime": datetime.now().astimezone().isoformat(),
