@@ -32,187 +32,113 @@
 
 ## 2. Automate のフローを作る
 
-ブロック名とフィールド名は[公式ドキュメント](https://llamalab.com/automate/doc/block/index.html)で確認済みのものです。
+ブロック名・欄の名前は[公式ドキュメント](https://llamalab.com/automate/doc/block/index.html)で確認済みのものです。
+番号は**ブロック1個につき1つ**です。同じ種類のブロックも縦に1個ずつ並べます。
 
-### 2-1. 先に2つの値を手元に用意する
+### 2-1. 先に用意するもの
+
+**保存フォルダ** `/sdcard/Download/automate`（他のファイルを置かないこと。中身は全部「未送信メモ」として送られます）。
+ファイルは8番が自動で作ります。初回に「すべてのファイルへのアクセス」を求められたら許可します。
+
+**PC の設定ファイルにある3つの値**
 
 ```bash
-cat config/calendar_webhook.json   # endpoint_url と secret
-cat config/tasks_event.json        # signal_url
+cat config/calendar_webhook.json   # endpoint_url（https://script.google.com/macros/s/…/exec）と secret（64文字）
+cat config/tasks_event.json        # signal_url（https://ntfy.sh/…）
 ```
 
-この3つをスマホにコピーしておきます。**secret と signal_url は鍵と同等**なので、送信手段には注意してください。
+Gmail の下書きや Google Keep 経由でスマホに渡し、**貼り終わったら消します**。
+`secret` と `signal_url` は鍵と同等です。前後の `"` はコピーしません。
 
-### 2-2. 新しいフローを作る
+### 2-2. fx ボタン（式モードと定数モード）
 
-Automate を開き、右下の **＋** → 空のフローを作成。`Flow beginning` が1個だけ置かれた状態から始めます。
+入力欄の fx アイコン（取り消し線付き）を押すと `=` が出て**式モード**になります。もう一度押すと**定数モード**に戻ります。
 
-ブロックの追加は、キャンバス長押し → カテゴリ選択 → ブロック選択です。接続は、ブロック下部の丸（出力）をドラッグして次のブロックの上部の丸（入力）へ落とします。
-
-### 2-3. ブロックを並べる
-
-以下の順に12個置きます。`→` は接続先です。
-
-| # | ブロック | 設定 |
-|---|---|---|
-| 1 | `Flow beginning` | そのまま |
-| 2 | `Assist request` | **Title** に「AIメモ」など |
-| 3 | `Speech recognition` | `Spoken texts` 欄に `spoken` と入力 |
-| 4 | `Expression true` | 発話が取れたか |
-| 5 | `Variable set` ×2 | `text` と `requestId` |
-| 6 | `File write` | 未送信キューの保存 |
-| 7 | `Failure catch` | **Retry limit** = 2 |
-| 8 | `HTTP request` ①取り込み | **Timeout 60** |
-| 9 | `Variable set` | `res = jsonDecode(body)` |
-| 10 | `Expression true` | 保存できたか |
-| 11 | `Vibrate` ＋ `File write` | 手応え＋キュー削除 |
-| 12 | `HTTP request` ②起動合図 | 失敗しても再送しない |
-
-**配線の要点は3つです。**
-
-- **2番（Assist request）がループの先頭です。** このブロックは「アシスト要求が来るまで一時停止」する仕様なので、処理が終わったら必ず2番へ戻してください。戻し忘れると**1回しか動きません**。
-- **7番（Failure catch）は8番より前に置きます。** このブロックが捕まえるのは「自分より後ろのブロック」の失敗だけです。`FAIL` 出口は11番ではなく「通知を出して2番へ戻る」に繋いでください。
-- **4番・10番の否定側出口も2番へ戻します。** 行き止まりにすると、失敗のたびにフローが死んでアシスト呼び出しに応答しなくなります。
-
-### 2-4. Automate の式の書き方
-
-**ここを知らずに書くと必ず弾かれます。**
-
-| よくある書き方 | Automate での正解 |
+| 印 | 意味 |
 |---|---|
-| `a == b` | **`a = b`** |
-| `a and b` | **`a && b`** |
-| `a or b` | **`a \|\| b`** |
+| `=` | fx を押して式モードにしてから書く（`jsonEncode(…)`、`spoken[0]` など） |
+| 定数 | fx は押さず、文字をそのまま書く（URL、`application/json` など） |
+| 変数名 | 結果を入れる変数の名前を書く欄。fx はない |
 
-配列と辞書はどちらも `[ ]` で取り出します（`["a","b"][1]` → `"b"`、`{"a":1}["a"]` → `1`）。
-`null`・`0`・空文字・空配列・空辞書はすべて偽として扱われるので、`x != null` ではなく
-`x` だけで「中身がある」を判定できます。
+定数モードのまま `jsonEncode({…})` を書くと保存できません。
 
-### 2-5. 各ブロックの中身
+式の書き方：等価は `=`、論理積は `&&`、文字の連結は `++`。配列も辞書も `[ ]` で取り出します。
+null・0・空文字・空配列は偽なので、`x` だけで「中身がある」を判定できます。
 
-**3番 Speech recognition**
+### 2-3. ブロックと配線
 
-`Spoken texts` は変数名ではなく、**結果を入れる変数の名前を自分で書き込む欄**です。
-公式の説明は "variable to assign an array of interpretation alternatives"。
+| # | ブロック | 設定 | 出口 |
+|---|---|---|---|
+| 1 | `Flow beginning` | そのまま | → 2 |
+| 2 | `Failure catch` | Retry limit 定数 `1000` | → 3 ／ FAIL → 19 |
+| 3 | `Assist request` | Title 定数 `AIメモ` | → 4 |
+| 4 | `Speech recognition` | Spoken texts 変数名 `spoken`、Offline オフ | → 5 |
+| 5 | `Expression true` | `=` `spoken && spoken[0] != ""` | YES → 6 ／ NO → 3 |
+| 6 | `Variable set` | Variable `text`、Value `=` `spoken[0]` | → 7 |
+| 7 | `Variable set` | Variable `requestId`、Value `=` `uuid4()` | → 8 |
+| 8 | `File write` | File `=` `"/sdcard/Download/automate/" ++ requestId ++ ".json"`、Content `=` `jsonEncode({"requestId": requestId, "text": text})`、Append オフ | → 9 |
+| 9 | `File list` | Path 定数 `/sdcard/Download/automate`、Filenames 変数名 `files` | → 10 |
+| 10 | `For each` | Container `=` `files`、Entry value 変数名 `path` | DO → 11 ／ OK → 3 |
+| 11 | `File read` | File `=` `path`、Text content 変数名 `saved` | → 12 |
+| 12 | `Variable set` | Variable `q`、Value `=` `jsonDecode(saved)` | → 13 |
+| 13 | `HTTP request`（取り込み） | 下記 | → 14 |
+| 14 | `Variable set` | Variable `res`、Value `=` `jsonDecode(body)` | → 15 |
+| 15 | `Expression true` | `=` `(status = 200) && res["ok"] && res["task_id"]` | YES → 16 ／ NO → 19 |
+| 16 | `File delete` | Path `=` `path`、Recursive オフ | → 17 |
+| 17 | `Vibrate` | 既定のまま | → 18 |
+| 18 | `HTTP request`（起動合図） | 下記 | → 10 |
+| 19 | `Notification show` | Title 定数 `AIメモ送信失敗`、Message 定数 `次に話したときに再送します` | → 3 |
+
+**13番 HTTP request（取り込み）**
 
 | 欄 | 値 |
 |---|---|
-| Spoken texts | `spoken` と入力（名前は任意） |
-| Confidence scores | 空のまま |
-| Offline | オフ（オンにすると認識精度が落ちます） |
-
-中身は**認識候補の配列**です。文字列としてそのまま送ると失敗します。
-
-**4番 Expression true**（発話が取れたか）
+| Request URL | 定数 `endpoint_url` の値 |
+| Request method | `POST` |
+| Request content type | 定数 `application/json` |
+| Request content body | `=` 下記（`ここにsecret` を置き換える） |
+| Timeout | 定数 **60**（既定15秒では足りません） |
+| Save response | **`Don't save`（既定のまま）** |
+| Response status code | 変数名 `status` |
+| Response content | 変数名 `body` |
 
 ```
-spoken && spoken[0] != ""
+jsonEncode({"secret": "ここにsecret", "action": "tasks_ingest", "text": q["text"], "request_id": q["requestId"]})
 ```
 
-出口は `YES` / `NO` の2本。`NO` は 2 へ戻します。
+`Save to file` にすると `body` に本文ではなくファイルのパスが入り、14番が失敗します。
+**Apps Script は認証失敗も HTTP 200 で返す**ので、15番で `res["ok"]` まで確認します。
 
-**5番 Variable set ×2**
-
-| Variable | Value |
-|---|---|
-| `text` | `spoken[0]` |
-| `requestId` | `uuid4()` |
-
-`requestId` は**発話ごとに1回だけ**作ります。再送のたびに作り直すと二重登録されます。
-
-**6番 File write**（未送信キュー）
+**18番 HTTP request（起動合図）**
 
 | 欄 | 値 |
 |---|---|
-| File | `/sdcard/Automate/ai-inbox-unsent.json` |
-| Content | `jsonEncode({"requestId": requestId, "text": text})` |
-| Append | オフ（上書き） |
-
-送信より**前**に保存します。HyperOS に止められても次の起動時に再送できます。
-
-**7番 Failure catch**
-
-`Retry limit` = 2。`FAIL` 出口 → `Notification show`「保存できませんでした」→ 2 へ戻す。
-
-**8番 HTTP request（①取り込み）**
-
-| フィールド | 値 |
-|---|---|
-| Request URL | `config/calendar_webhook.json` の `endpoint_url` |
+| Request URL | 定数 `signal_url` の値 |
 | Request method | `POST` |
-| Request content type | `application/json` |
-| Request content body | 下記 |
-| **Timeout** | **60** ← 既定15秒では足りません |
-| **Save response** | **`Don't save`（既定のまま）** |
-| Response status code | `status` と入力 |
-| Response content | `body` と入力 |
+| Request content type | 定数 `text/plain` |
+| Request content body | 定数 `tasks_changed`（**`"` を付けない**） |
 
-`Save to file` にすると `Response content` に入るのは本文ではなく**ファイルのパス**で、
-`jsonDecode` が失敗します。既定のままにしてください。
+PC側は本文が `tasks_changed` と完全一致するときだけ動きます。定数モードで `"tasks_changed"` と書くと引用符まで送られ、無視されます。
 
-```
-jsonEncode({
-  "secret":     "<calendar_webhook.json の secret>",
-  "action":     "tasks_ingest",
-  "text":       text,
-  "request_id": requestId
-})
-```
+### 2-4. この形にしている理由
 
-**9番 Variable set**
+- **保存してから送る。** 8番で1件1ファイルに保存し、9〜18番でフォルダに残る全件を送って、送れた分だけ消します。失敗したメモは**次に話したときに一緒に再送**されます。同じ `requestId` のままなので、実は届いていた場合も `duplicate` になり二重登録されません。
+- **再送用の別フローは作らない。** Automate は再起動後、フローを最初からではなく**止まったブロックから再開**します。起動時に走る再送フローという前の設計は動きませんでした。
+- **`Failure catch` は先頭に1個、上限1000。** 後続ブロックすべてを守れます。上限に達するとフローが止まる仕様なので、小さい値は危険です。
 
-| Variable | Value |
-|---|---|
-| `res` | `jsonDecode(body)` |
-
-一度変数に置いてから取り出します。式の中で関数の結果に直接 `[ ]` を付けるより確実で、
-2回パースする無駄もありません。
-
-**10番 Expression true**（保存できたか）
-
-```
-(status = 200) && res["ok"] && res["task_id"]
-```
-
-`= 200` は `&&` との優先順位を確実にするため括弧で囲みます。
-
-**Apps Script は認証失敗も HTTP 200 の JSON で返します。** ステータスだけ見ると、
-保存できていないのにバイブが鳴ります。ここが最も間違えやすい箇所です。
-
-**11番 Vibrate + File write**
-
-バイブで手応えを返し、`File write` で未送信キューを空にします（`Content` を `""`、`Append` オフ）。
-
-**12番 HTTP request（②起動合図）**
-
-| フィールド | 値 |
-|---|---|
-| Request URL | `config/tasks_event.json` の `signal_url` |
-| Request method | `POST` |
-| Request content type | `text/plain` |
-| Request content body | `"tasks_changed"` |
-| Timeout | 15（既定のまま） |
-
-**②は失敗しても再送しません。** ①が通っていれば保存は済んでいて、②の失敗は
-「PCが動き出すのが遅れる」だけです。PC側の定期確認（既定15分）が拾います。
-
-### 2-6. 起動時に未送信を再送する（任意だが推奨）
-
-別フローを1つ作り、`Flow beginning` → `File read` → 中身があれば 8番と同じ `HTTP request` を実行、という形にします。**保存済みの `requestId` をそのまま使う**ので、既に登録されていた場合は `duplicate: true` が返るだけで二重登録されません。
-
-Automate の設定で、このフローを端末起動時に自動実行するようにしておきます。
-
-### 2-7. アシスタントとして登録する
+### 2-5. アシスタントとして登録する
 
 ```
 設定 → アプリ → 標準のアプリ → デジタルアシスタントアプリ → Automate
-```
-
-電源ボタン長押しがアシスタント呼び出しに割り当たっていることも確認してください。
-
-```
 設定 → 追加設定 → ボタンショートカット → 電源ボタンを長押し
+Automate 左上メニュー → Settings → Run on system startup をオン
 ```
+
+### 2-6. 組み終わったら確認する
+
+1. 「テスト」と話す → バイブが鳴り、`/sdcard/Download/automate` が空になる
+2. 機内モードで話す → 通知が出て、ファイルが1つ残る
+3. 機内モードを切ってもう一度話す → バイブが2回鳴り、フォルダが空になる
 
 ## 3. Xiaomi（HyperOS / MIUI）での必須設定
 
@@ -230,25 +156,25 @@ Automate の設定で、このフローを端末起動時に自動実行する�
 最近のアプリ画面 → Automate のカードを下にスワイプ → 🔒
 ```
 
-止められたこと自体は Automate では検知できません。だから 2-6 の起動時再送と、
-①成功時のバイブ（＝保存できた手応え）の両方が必要になります。
+止められたこと自体は Automate では検知できません。だから未送信ファイルの再送（2-4）と、
+17番のバイブ（＝保存できた手応え）の両方が必要になります。
 
 ## 4. この内容の根拠
 
-ブロック名・フィールド名・演算子はすべて公式リファレンスで確認しています。
-
 | 確認したこと | 出典 |
 |---|---|
-| `Spoken texts` は「割り当て先の変数」 | [Speech recognition](https://llamalab.com/automate/doc/block/speech_recognition.html) |
-| 等価は `=`、論理積は `&&` | [Expressions & operators](https://llamalab.com/automate/doc/expression.html) |
-| 配列・辞書はどちらも `[ ]` | [Expressions & operators](https://llamalab.com/automate/doc/expression.html) |
-| `Timeout` 既定15秒、`Save response` 既定 `Don't save` | [HTTP request](https://llamalab.com/automate/doc/block/http_request.html) |
-| `Failure catch` は後続ブロックのみ保護 | [Failure catch](https://llamalab.com/automate/doc/block/failure_catch.html) |
-| `Assist request` は要求が来るまで一時停止 | [Assist request](https://llamalab.com/automate/doc/block/assist_request.html) |
-| `text uuid4()` は引数なし | [uuid4](https://llamalab.com/automate/doc/function/uuid4.html) |
-| `File write` の欄は `File` / `Content` / `Append` | [File write](https://llamalab.com/automate/doc/block/file_write.html) |
+| fx で式モード／定数モードを切り替える | [Expressions](https://llamalab.com/automate/doc/expression.html) |
+| 等価 `=`、論理積 `&&`、連結 `++`、辞書 `{"a":1}` | [Expressions](https://llamalab.com/automate/doc/expression.html) |
+| `Spoken texts` は割り当て先の変数 | [Speech recognition](https://llamalab.com/automate/doc/block/speech_recognition.html) |
+| `Failure catch` は後続の失敗を FAIL へ、上限超過で停止（既定3） | [Failure catch](https://llamalab.com/automate/doc/block/failure_catch.html) |
+| `File list` の Filenames はパスの配列 | [File list](https://llamalab.com/automate/doc/block/file_list.html) |
+| `For each` の出口は DO / OK | [For each](https://llamalab.com/automate/doc/block/for_each.html) |
+| `File read` の出力は Text content | [File read](https://llamalab.com/automate/doc/block/file_read.html) |
+| `File delete` の欄は Path / Recursive | [File delete](https://llamalab.com/automate/doc/block/file_delete.html) |
+| `Timeout` 既定15秒、`Save response` 既定 Don't save | [HTTP request](https://llamalab.com/automate/doc/block/http_request.html) |
+| 再起動後は止まったブロックから再開 | [FAQ](https://llamalab.com/automate/doc/faq.html) |
 
-それでも式エディタが受け付けない場合は、エラーメッセージをそのまま知らせてください。
+式エディタが受け付けない場合は、エラーメッセージと何番のどの欄かを知らせてください。
 
 ## 5. Gemini 経由は残しておく
 
