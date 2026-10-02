@@ -285,3 +285,32 @@ class CorrectionTests(MultiItemNoteTests):
                 self.conn, self.cur, FakeKeep([note]), note, "google_tasks"
             )
         self.assertEqual(captured["recent"][0]["summary"], "歯医者")
+
+
+class SparseOutputTests(unittest.TestCase):
+    """The model omits empty fields; the rest of the pipeline must not notice."""
+
+    def test_omitted_fields_are_restored_with_their_empty_values(self):
+        items = watch_keep.normalize_items({"items": [
+            {"intent": "memo", "summary": "駐車場は3階"},
+        ]})
+        item = items[0]
+        self.assertEqual(set(item), set(watch_keep.ITEM_SCHEMA["properties"]))
+        self.assertIsNone(item["scheduled_at"])
+        self.assertIs(item["calendar_ready"], False)
+        self.assertEqual(item["actions"], [])
+
+    def test_written_fields_survive(self):
+        items = watch_keep.normalize_items({"items": [{
+            "intent": "calendar", "summary": "面談", "calendar_ready": True,
+            "event_start": "2026-10-06T15:00:00+09:00",
+        }]})
+        self.assertIs(items[0]["calendar_ready"], True)
+        self.assertEqual(items[0]["event_start"], "2026-10-06T15:00:00+09:00")
+
+    def test_defaults_are_not_shared_between_items(self):
+        first, second = watch_keep.normalize_items({"items": [
+            {"intent": "memo", "summary": "a"}, {"intent": "memo", "summary": "b"},
+        ]})
+        first["actions"].append("x")
+        self.assertEqual(second["actions"], [])

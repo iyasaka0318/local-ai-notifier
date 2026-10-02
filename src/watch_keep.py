@@ -203,6 +203,25 @@ ITEM_SCHEMA = {   'type': 'object',
                     'correction_action']}
 
 
+# Only these are always written. Every other field is omitted when it would be
+# null, false or empty, and item_defaults() restores it after parsing: writing
+# two dozen empty fields per item was most of the generation time.
+ITEM_SCHEMA["required"] = ["intent", "summary"]
+
+
+def item_defaults():
+    defaults = {}
+    for name, spec in ITEM_SCHEMA["properties"].items():
+        kind = spec.get("type")
+        if kind == "array":
+            defaults[name] = []
+        elif kind == "boolean":
+            defaults[name] = False
+        else:
+            defaults[name] = None
+    return defaults
+
+
 CLASSIFY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -222,6 +241,9 @@ requests, for example "明日9時に歯医者、あと牛乳買うのリマイ�
 第74回の登録開始も見張っといて". Emit one item per distinct request, in the order
 they were spoken. Emit exactly one item when the note contains one request.
 Never merge two unrelated requests into one item and never drop one.
+Write only the fields that carry a value. Omit every field that would be null,
+false or an empty list: an omitted field is read as exactly that. intent and
+summary are always written.
 
 NEVER ASK, ALWAYS DECIDE
 The user speaks into a phone and will not answer follow-up questions. Choosing
@@ -740,7 +762,9 @@ def normalize_items(result):
         items = [result]
     else:
         items = []
-    return [item for item in items if item.get("intent")]
+    return [
+        {**item_defaults(), **item} for item in items if item.get("intent")
+    ]
 
 
 def classify_note(
