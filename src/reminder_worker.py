@@ -8,6 +8,7 @@ import requests
 from failure_notifier import notify_processing_failure
 from instance_lock import SingleInstanceLock
 from project_paths import DB_PATH, RUNTIME_DIR, ensure_runtime_directories
+from phone_commands import dispatch_phone_commands
 from report_notifier import send_execution_report
 from state_store import drain_remote_deletes, drain_reports, ensure_schema, utc_now
 
@@ -239,6 +240,34 @@ def dispatch_persistent_now(
     return sent
 
 
+WEEKDAY_CODES = {"mo": 0, "tu": 1, "we": 2, "th": 3, "fr": 4, "sa": 5, "su": 6}
+
+
+def next_occurrence(due_at, recurrence, now):
+    """When a repeating reminder is due next, or None when it does not repeat.
+
+    Occurrences missed during an outage are skipped rather than replayed.
+    "weekly:MO/TU/WE/TH/FR" repeats on each listed day; a single day keeps the
+    weekday the reminder was scheduled on and steps a week at a time.
+    """
+    recurrence = (recurrence or "").lower()
+    local_now = now.astimezone(due_at.tzinfo)
+    if recurrence == "daily":
+        days, step = None, 1
+    elif recurrence.startswith("weekly:"):
+        codes = recurrence.split(":", 1)[1].replace(",", "/").split("/")
+        days = {WEEKDAY_CODES[code.strip()] for code in codes if code.strip() in WEEKDAY_CODES}
+        step = 1 if len(days) > 1 else 7
+        if step == 7:
+            days = None
+    else:
+        return None
+    next_at = due_at + timedelta(days=step)
+    while next_at <= local_now or (days is not None and next_at.weekday() not in days):
+        next_at += timedelta(days=step)
+    return next_at
+
+
 def dispatch_due_reminders(conn, topic, now=None, sender=send_notification):
     now = now or datetime.now(LOCAL_TIMEZONE)
     stale_sending_before = (now - timedelta(minutes=5)).isoformat()
@@ -305,13 +334,7 @@ def dispatch_due_reminders(conn, topic, now=None, sender=send_notification):
             continue
 
         timestamp = utc_now()
-        recurrence = (recurrence or "").lower()
-        if recurrence == "daily":
-            next_at = due_at + timedelta(days=1)
-        elif recurrence.startswith("weekly:"):
-            next_at = due_at + timedelta(days=7)
-        else:
-            next_at = None
+        next_at = next_occurrence(due_at, recurrence, now)
 
         if next_at is None:
             final_cursor = conn.execute("""
@@ -321,9 +344,6 @@ def dispatch_due_reminders(conn, topic, now=None, sender=send_notification):
                 WHERE note_id = ? AND status = 'sending'
             """, (timestamp, timestamp, note_id))
         else:
-            step = timedelta(days=1 if recurrence == "daily" else 7)
-            while next_at <= now.astimezone(next_at.tzinfo):
-                next_at += step
             final_cursor = conn.execute("""
                 UPDATE reminders
                 SET status = 'pending', scheduled_at = ?, notified_at = ?,
@@ -358,6 +378,9 @@ def main():
             print(f"Re-sent {delivered} execution report(s)")
         sent = dispatch_due_reminders(conn, topic)
         sent += dispatch_persistent_reminders(conn, topic)
+        commands = dispatch_phone_commands(conn, topic)
+        if commands:
+            print(f"Sent {commands} phone command(s)")
     finally:
         conn.close()
     if sent:

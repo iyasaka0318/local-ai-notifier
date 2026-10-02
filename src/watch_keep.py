@@ -40,6 +40,11 @@ from reminder_worker import (
     send_notification,
 )
 from failure_notifier import notify_processing_failure
+from phone_commands import (
+    alarm_command,
+    dispatch_phone_commands,
+    queue_phone_command,
+)
 from state_store import (
     cancel_reminders,
     cancel_web_monitors,
@@ -107,7 +112,8 @@ ITEM_SCHEMA = {   'type': 'object',
                                                 'research',
                                                 'unknown',
                                                 'correction',
-                                                'question']},
+                                                'question',
+                                                'alarm']},
                       'summary': {'type': 'string'},
                       'notification_text': {'type': ['string', 'null']},
                       'event_title': {'type': ['string', 'null']},
@@ -265,6 +271,12 @@ the most reasonable interpretation is always better than refusing to decide.
 
 Intents:
 - reminder: the user explicitly asks to be notified/reminded at a time.
+- alarm: the user asks for the phone's clock alarm, with words such as
+  "アラーム", "目覚まし" or "〜時に起こして". It rings on the phone until it is
+  stopped, unlike a reminder, which is a notification. Set scheduled_at to the
+  resolved ISO 8601 datetime with +09:00 and notification_text to a short label
+  for the alarm (null when the user gave none). "通知して" and "リマインドして"
+  without those words stay reminder.
 - persistent_reminder: manages a locally saved task that has no specific due
   date/time and should remain active until the user says it is finished. It also
   covers commands to notify all currently saved persistent reminder tasks now.
@@ -377,9 +389,11 @@ Rules:
   quotation fillers such as "って" when they only instruct this system. Preserve
   the task meaning. Example: "明日の午前4時に部屋の掃除をするって通知して"
   becomes notification_text "部屋の掃除をする". For non-reminders use null.
-- scheduled_at must be null for every non-reminder intent.
+- scheduled_at must be null for every intent other than reminder and alarm.
 - recurrence is null for one-time reminders. For repeating reminders use only
-  daily or weekly:MO/TU/WE/TH/FR/SA/SU.
+  "daily", or "weekly:" followed by one or more day codes (MO TU WE TH FR SA SU)
+  joined with "/": "weekly:MO" for every Monday, "weekly:MO/TU/WE/TH/FR" for
+  weekdays, "weekly:SA/SU" for weekends. scheduled_at is the first occurrence.
 - For research, return an ordered actions list. The first action is research.
   Add save_memo when the result should be saved to Keep. Add notify when the result
   should be sent. Use execute_at for when research starts and scheduled_at for when
@@ -854,6 +868,8 @@ def format_detail(item):
     intent = item.get("intent")
     if intent == "reminder" and item.get("scheduled_at"):
         return _format_reminder_time(item["scheduled_at"])
+    if intent == "alarm" and item.get("_alarm_detail"):
+        return item["_alarm_detail"]
     if intent == "calendar" and item.get("event_start"):
         if item.get("all_day"):
             return _format_reminder_time(item["event_start"]).split(" ")[0]
@@ -874,6 +890,8 @@ def report_summary(item):
         return item.get("event_title") or item.get("summary") or ""
     if item.get("intent") == "persistent_reminder":
         return item.get("persistent_task_text") or item.get("summary") or ""
+    if item.get("intent") == "alarm":
+        return item.get("notification_text") or "アラーム"
     return item.get("summary") or ""
 
 
@@ -1202,6 +1220,18 @@ def process_item(conn, cur, item, item_id, source_note_id, ai_text, inbox_source
     elif intent == "wake_briefing":
         upsert_wake_job(cur, item_id, source_note_id=source_note_id)
 
+    elif intent == "alarm":
+        payload, send_after, alarm_time = alarm_command(
+            item["scheduled_at"], item.get("notification_text")
+        )
+        queue_phone_command(
+            cur, item_id, source_note_id, "alarm_add", payload, send_after
+        )
+        item["_alarm_detail"] = _format_reminder_time(alarm_time.isoformat())
+        if send_after > datetime.now(alarm_time.tzinfo):
+            # Tell the user why the clock app does not show it yet.
+            item["_alarm_detail"] += "（前日にスマホへ登録します）"
+
     elif intent == "research":
         upsert_research_job(cur, item_id, build_research_plan(item, ai_text))
 
@@ -1244,6 +1274,10 @@ def run_side_effects(conn, item, item_id):
         dispatch_persistent_now(conn, NTFY_TOPIC, item_id)
     elif intent == "question":
         send_notification(NTFY_TOPIC, item["_answer"]["text"], title="メモへの回答")
+    elif intent == "alarm":
+        # Sent now rather than at the next minute tick. A failure leaves the
+        # command queued, and reminder_worker retries it.
+        dispatch_phone_commands(conn, NTFY_TOPIC)
 
 
 # =========================================================

@@ -376,6 +376,25 @@ def ensure_schema(conn):
         ON pending_reports (sent_at, created_at)
     """)
 
+    # Commands for the phone (alarms). A command can be held for days: the
+    # clock app only takes a time of day, so an alarm further out than a day
+    # is sent the day before it should ring.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS phone_commands (
+            note_id TEXT PRIMARY KEY,
+            source_note_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            send_after TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            claimed_at TEXT,
+            sent_at TEXT
+        )
+    """)
+
     _add_column(conn, "persistent_reminders", "group_name TEXT")
     _add_column(conn, "web_monitors", "notified_at TEXT")
 
@@ -1054,6 +1073,14 @@ def supersede_orphan_items(cursor, source_note_id, active_item_ids, now=None):
         f"""
         UPDATE web_monitors SET status = 'superseded'
         WHERE source_note_id = ? AND status = 'active'
+          AND note_id NOT IN ({placeholders})
+        """,
+        [source_note_id, *active],
+    )
+    cursor.execute(
+        f"""
+        UPDATE phone_commands SET status = 'superseded'
+        WHERE source_note_id = ? AND status = 'pending'
           AND note_id NOT IN ({placeholders})
         """,
         [source_note_id, *active],

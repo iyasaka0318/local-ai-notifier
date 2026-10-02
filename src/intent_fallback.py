@@ -19,6 +19,9 @@ RESEARCH_WITHOUT_OBJECTIVE = "調べる対象が読み取れなかったので�
 MONITOR_WITHOUT_TARGET = "監視対象が読み取れなかったので、TODOとして保存しました。"
 CORRECTION_WITHOUT_TARGET = "訂正する対象が分からなかったので、メモとして保存しました。"
 
+ALARM_REPEATING = "繰り返しのアラームには対応していないので、繰り返しリマインダーにしました。"
+ALARM_WITHOUT_TIME = "アラームの時刻が読み取れなかったので、継続リマインドとして保存しました。"
+
 CORRECTION_ACTIONS = ("cancel", "reschedule", "rewrite", "append")
 
 
@@ -61,6 +64,19 @@ def apply_intent_fallback(item):
     """Return (item, reason). ``reason`` is None when nothing was rewritten."""
     item = dict(item)
     intent = item.get("intent")
+
+    if intent == "alarm":
+        # The clock app is given one time of day. Anything it cannot express
+        # becomes a reminder, which can repeat and can live without a time.
+        if _parsable_datetime(item.get("scheduled_at")) and _blank(item.get("recurrence")):
+            return item, None
+        item["intent"] = intent = "reminder"
+        if _blank(item.get("notification_text")):
+            item["notification_text"] = item.get("summary")
+        if _parsable_datetime(item.get("scheduled_at")):
+            return item, ALARM_REPEATING
+        routed, _reason = apply_intent_fallback(item)
+        return routed, ALARM_WITHOUT_TIME
 
     if intent == "reminder" and not _parsable_datetime(item.get("scheduled_at")):
         # Decide the reason before the field is cleared below, so the report

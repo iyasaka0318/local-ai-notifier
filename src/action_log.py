@@ -14,6 +14,7 @@ trail of what the classifier actually decided.
 
 import secrets
 
+from phone_commands import cancel_phone_command
 from state_store import (
     enqueue_remote_delete,
     has_open_remote_delete,
@@ -31,6 +32,7 @@ KIND_LABELS = {
     "web_monitor": "Web監視",
     "research": "調査",
     "wake_briefing": "起床ブリーフィング",
+    "alarm": "アラーム",
 }
 
 UNDOABLE_KINDS = frozenset({
@@ -41,6 +43,7 @@ UNDOABLE_KINDS = frozenset({
     "memo",
     "web_monitor",
     "research",
+    "alarm",
 })
 
 
@@ -300,6 +303,16 @@ def undo_action(conn, token, pending_calendar_deletes=None, now=None):
             changed = _undo_web_monitor(conn, item_id)
         elif kind == "research":
             changed = _undo_research(conn, item_id)
+        elif kind == "alarm":
+            outcome = cancel_phone_command(conn, item_id)
+            if outcome == "sent":
+                # Nothing outside the clock app can remove an alarm, and
+                # claiming success would leave it ringing unannounced.
+                return False, (
+                    "アラームはすでにスマホに登録済みです。"
+                    f"時計アプリで削除してください: {action['summary']}"
+                )
+            changed = outcome == "cancelled"
         else:
             return False, f"この操作は取り消しに対応していません: {action['summary']}"
     except Exception as error:

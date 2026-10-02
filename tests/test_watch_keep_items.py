@@ -518,3 +518,69 @@ class ResearchDeliveryTests(unittest.TestCase):
             {"type": "save_memo"},
         ]
         self.assertEqual(self.plan("天気を調べてメモに残して", actions)["notify_mode"], "none")
+
+
+class AlarmTests(MultiItemNoteTests):
+    def setUp(self):
+        super().setUp()
+        self.sent = []
+        patcher = mock.patch.object(
+            watch_keep, "dispatch_phone_commands",
+            side_effect=lambda conn, topic: self.sent.append(topic) or 1,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def command(self):
+        return self.conn.execute(
+            "SELECT note_id, action, payload, status FROM phone_commands"
+        ).fetchone()
+
+    def test_an_alarm_is_queued_for_the_phone_and_dispatched(self):
+        self.run_note(FakeNote("a1", text="7時にゴミ出しでアラーム"), [
+            item("alarm", summary="7時にアラーム", notification_text="ゴミ出し",
+                 scheduled_at="2099-01-01T07:00:00+09:00"),
+        ])
+        note_id, action, payload, status = self.command()
+        self.assertEqual((note_id, action, status), ("a1", "alarm_add", "pending"))
+        self.assertIn('"seconds": 25200', payload)
+        self.assertIn("ゴミ出し", payload)
+        self.assertEqual(len(self.sent), 1)
+        entry = self.reports[0][0]
+        self.assertEqual((entry["kind"], entry["summary"]), ("alarm", "ゴミ出し"))
+        self.assertIn("前日にスマホへ登録", entry["detail"])
+
+    def test_a_repeating_alarm_becomes_a_repeating_reminder(self):
+        self.run_note(FakeNote("a1", text="毎朝7時にアラーム"), [
+            item("alarm", summary="毎朝7時に起きる", notification_text="起きる",
+                 scheduled_at="2099-01-01T07:00:00+09:00", recurrence="daily"),
+        ])
+        self.assertIsNone(self.command())
+        self.assertEqual(self.conn.execute(
+            "SELECT recurrence FROM reminders WHERE note_id = 'a1'"
+        ).fetchone(), ("daily",))
+        self.assertIn("繰り返しのアラーム", self.reports[0][0]["fallback_reason"])
+
+    def test_an_alarm_without_a_time_is_kept_as_a_task(self):
+        self.run_note(FakeNote("a1", text="アラームかけて"), [
+            item("alarm", summary="アラームをかける"),
+        ])
+        self.assertIsNone(self.command())
+        self.assertIn("アラームの時刻", self.reports[0][0]["fallback_reason"])
+
+    def test_undo_before_sending_cancels_the_command(self):
+        self.run_note(FakeNote("a1", text="アラーム"), [
+            item("alarm", summary="アラーム", scheduled_at="2099-01-01T07:00:00+09:00"),
+        ])
+        ok, _message = watch_keep.undo_action(self.conn, self.reports[0][0]["token"])
+        self.assertTrue(ok)
+        self.assertEqual(self.command()[3], "cancelled")
+
+    def test_undo_after_sending_says_to_delete_it_on_the_phone(self):
+        self.run_note(FakeNote("a1", text="アラーム"), [
+            item("alarm", summary="アラーム", scheduled_at="2099-01-01T07:00:00+09:00"),
+        ])
+        self.conn.execute("UPDATE phone_commands SET status = 'sent'")
+        ok, message = watch_keep.undo_action(self.conn, self.reports[0][0]["token"])
+        self.assertFalse(ok)
+        self.assertIn("時計アプリ", message)

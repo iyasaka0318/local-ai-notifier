@@ -264,5 +264,37 @@ class ReminderWorkerTests(unittest.TestCase):
         self.assertEqual(sent, ["タスクA"])
 
 
+class NextOccurrenceTests(unittest.TestCase):
+    def at(self, day, hour=7):
+        return datetime(2026, 10, day, hour, 0, tzinfo=JST)
+
+    def test_weekdays_skip_the_weekend(self):
+        from reminder_worker import next_occurrence
+        friday = self.at(2)   # 2026-10-02 is a Friday
+        self.assertEqual(
+            next_occurrence(friday, "weekly:MO/TU/WE/TH/FR", self.at(2, 8)), self.at(5)
+        )
+
+    def test_weekdays_continue_the_next_day_midweek(self):
+        from reminder_worker import next_occurrence
+        self.assertEqual(
+            next_occurrence(self.at(5), "weekly:MO/TU/WE/TH/FR", self.at(5, 8)), self.at(6)
+        )
+
+    def test_a_single_day_steps_one_week(self):
+        from reminder_worker import next_occurrence
+        self.assertEqual(next_occurrence(self.at(5), "weekly:MO", self.at(5, 8)), self.at(12))
+
+    def test_missed_weekday_occurrences_are_skipped(self):
+        from reminder_worker import next_occurrence
+        self.assertEqual(
+            next_occurrence(self.at(5), "weekly:MO/TU/WE/TH/FR", self.at(8, 8)), self.at(9)
+        )
+
+    def test_no_recurrence_has_no_next_occurrence(self):
+        from reminder_worker import next_occurrence
+        self.assertIsNone(next_occurrence(self.at(5), None, self.at(5, 8)))
+
+
 if __name__ == "__main__":
     unittest.main()

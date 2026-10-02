@@ -36,6 +36,7 @@ KIND_LABELS = {
     "research": "調べもの",
     "web_monitor": "Web監視",
     "calendar_event": "カレンダー",
+    "alarm": "アラーム",
 }
 STATUS_TABLES = {
     "memo": "memos",
